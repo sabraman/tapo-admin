@@ -58,7 +58,9 @@ describe("AppStorage", () => {
 
       const loaded = storage.loadSession();
       expect(loaded?.token).toBe("tok-123");
-      expect(statSync(storage.sessionPath).mode & 0o777).toBe(0o600);
+      if (process.platform !== "win32") {
+        expect(statSync(storage.sessionPath).mode & 0o777).toBe(0o600);
+      }
 
       storage.clearSession();
       expect(storage.loadSession()).toBeNull();

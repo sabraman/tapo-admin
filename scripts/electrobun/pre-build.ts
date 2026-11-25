@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 const rootDir = join(import.meta.dir, "..", "..");
 
-const buildProc = Bun.spawnSync(["bun", "run", join(rootDir, "scripts", "build-client.ts")], {
+const buildProc = Bun.spawnSync([process.execPath, "run", join(rootDir, "scripts", "build-client.ts")], {
   cwd: rootDir,
   stdin: "inherit",
   stdout: "inherit",
