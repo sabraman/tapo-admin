@@ -101,6 +101,7 @@ jobs:
       - name: Download desktop artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: desktop-*
           path: release-assets
           merge-multiple: true
 
