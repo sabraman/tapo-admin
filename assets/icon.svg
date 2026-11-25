@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="64" y1="32" x2="448" y2="480" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1e293b" />
+      <stop offset="100%" stop-color="#090d16" />
+    </linearGradient>
+    <linearGradient id="cyanRing" x1="140" y1="140" x2="372" y2="372" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="50%" stop-color="#06b6d4" />
+      <stop offset="100%" stop-color="#0891b2" />
+    </linearGradient>
+    <radialGradient id="lensGlass" cx="0.42" cy="0.38" r="0.6">
+      <stop offset="0%" stop-color="#164e63" />
+      <stop offset="65%" stop-color="#0b1324" />
+      <stop offset="100%" stop-color="#030712" />
+    </radialGradient>
+  </defs>
+
+  <!-- Outer dark slate rounded tile -->
+  <rect x="28" y="28" width="456" height="456" rx="108" fill="url(#bg)" stroke="#334155" stroke-width="8" />
+
+  <!-- Subtle camera housing bezel -->
+  <circle cx="256" cy="256" r="144" fill="#0b1220" stroke="#1e293b" stroke-width="6" />
+
+  <!-- Cyan aperture ring -->
+  <circle cx="256" cy="256" r="112" stroke="url(#cyanRing)" stroke-width="20" />
+
+  <!-- Inner lens glass -->
+  <circle cx="256" cy="256" r="80" fill="url(#lensGlass)" />
+  <circle cx="256" cy="256" r="34" fill="#040812" stroke="#0e7490" stroke-width="4" />
+
+  <!-- Lens specular highlight -->
+  <circle cx="222" cy="220" r="18" fill="#67e8f9" fill-opacity="0.45" />
+  <circle cx="286" cy="288" r="7" fill="#38bdf8" fill-opacity="0.25" />
+
+  <!-- Live emerald indicator dot -->
+  <circle cx="382" cy="130" r="30" fill="#090d16" />
+  <circle cx="382" cy="130" r="21" fill="#10b981" />
+  <circle cx="376" cy="124" r="6" fill="#a7f3d0" fill-opacity="0.7" />
+</svg>

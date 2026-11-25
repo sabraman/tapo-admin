@@ -1,0 +1,18 @@
+services:
+  tapo-admin:
+    build: .
+    container_name: tapo-admin
+    restart: unless-stopped
+    # Bound to localhost by default. Terminate TLS in front of it with Caddy
+    # or Tailscale Serve for LAN/WAN access (WebCodecs & mic talkback require HTTPS),
+    # or change to "3456:3456" only on a trusted private network.
+    ports:
+      - "127.0.0.1:${PORT:-3456}:3456"
+    volumes:
+      - ./data:/data
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3456"
+      TAPO_DATA_DIR: "/data"
+      TAPO_ACCESS_PASSWORD: "${TAPO_ACCESS_PASSWORD:-}"
+      TAPO_DEBUG_EMULATOR: "${TAPO_DEBUG_EMULATOR:-false}"
