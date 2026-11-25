@@ -37,6 +37,7 @@ interface MediaGalleryDialogProps {
   open: boolean;
   media: MediaItem[];
   mediaDir: string;
+  initialItemId?: string | null;
   onOpenChange: (open: boolean) => void;
   onDeleteMedia: (id: string) => Promise<void>;
 }
@@ -45,6 +46,7 @@ export function MediaGalleryDialog({
   open,
   media,
   mediaDir,
+  initialItemId,
   onOpenChange,
   onDeleteMedia,
 }: MediaGalleryDialogProps): React.ReactElement {
@@ -62,6 +64,13 @@ export function MediaGalleryDialog({
     () => filtered.find((m) => m.id === selectedId) ?? filtered[0] ?? null,
     [filtered, selectedId],
   );
+
+  useEffect(() => {
+    if (open && initialItemId) {
+      setFilter("all");
+      setSelectedId(initialItemId);
+    }
+  }, [open, initialItemId]);
 
   useEffect(() => {
     if (open && filtered.length > 0 && !filtered.some((m) => m.id === selectedId)) {

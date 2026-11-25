@@ -117,6 +117,7 @@ export function App(): React.ReactElement {
   const [autoCyclePaused, setAutoCyclePaused] = useState(false);
 
   const [galleryOpen, setGalleryOpen] = useState(false);
+  const [galleryInitialId, setGalleryInitialId] = useState<string | null>(null);
   const [systemOpen, setSystemOpen] = useState(false);
   const [systemTab, setSystemTab] = useState<"stream" | "stores" | "diagnostics" | "account">(
     "stream",
@@ -300,6 +301,32 @@ export function App(): React.ReactElement {
     setFocusedId(visibleCameras[nextIdx]!.deviceId);
   }
 
+  function notifySavedMedia(title: string, item: MediaItem) {
+    const openSaved = (id: string) => {
+      toastManager.close(id);
+      setGalleryInitialId(item.id);
+      setGalleryOpen(true);
+    };
+    const toastId = toastManager.add({
+      title,
+      description: item.filename,
+      type: "success",
+      actionProps: {
+        children: t("openGallery"),
+        onClick: () => openSaved(toastId),
+      },
+      data: {
+        rootProps: {
+          style: { cursor: "pointer" },
+          onClick: (e: React.MouseEvent) => {
+            if ((e.target as HTMLElement).closest('[data-slot="toast-action"]')) return;
+            openSaved(toastId);
+          },
+        },
+      },
+    });
+  }
+
   async function captureSnapshotToGallery(deviceId: string) {
     if (isSimulatedCamera(deviceId)) {
       toastManager.add({
@@ -316,11 +343,7 @@ export function App(): React.ReactElement {
       );
       setMedia(res.media);
       setMediaDir(res.mediaDir);
-      toastManager.add({
-        title: t("toastSnapshotSaved"),
-        description: res.item.filename,
-        type: "success",
-      });
+      notifySavedMedia(t("toastSnapshotSaved"), res.item);
     } catch (err) {
       toastManager.add({
         title: t("toastSnapshotError"),
@@ -347,11 +370,7 @@ export function App(): React.ReactElement {
       );
       setMedia(res.media);
       setMediaDir(res.mediaDir);
-      toastManager.add({
-        title: t("toastClipSaved"),
-        description: res.item.filename,
-        type: "success",
-      });
+      notifySavedMedia(t("toastClipSaved"), res.item);
     } catch (err) {
       toastManager.add({
         title: t("toastClipError"),
@@ -987,10 +1006,14 @@ export function App(): React.ReactElement {
 
       {/* Media Gallery Dialog (shows saved snapshots, MP4 clips, and server path) */}
       <MediaGalleryDialog
+        initialItemId={galleryInitialId}
         media={media}
         mediaDir={mediaDir}
         onDeleteMedia={deleteMedia}
-        onOpenChange={setGalleryOpen}
+        onOpenChange={(isOpen) => {
+          setGalleryOpen(isOpen);
+          if (!isOpen) setGalleryInitialId(null);
+        }}
         open={galleryOpen}
       />
 
