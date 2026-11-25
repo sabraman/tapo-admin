@@ -22,6 +22,7 @@ import { streamSdRecordingMp4 } from "./playback";
 import { AppStorage, type StoredSession } from "./storage";
 import { StreamManager } from "./stream-manager";
 import { type CloudFamily, TapoCloudClient, TapoCloudError } from "./tapo-cloud";
+import { createFallbackUpdater, getPackageVersion } from "./updater";
 
 export interface WsStreamData {
   kind: "fmp4" | "ts" | "audio" | "talk";
@@ -77,6 +78,12 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
   const debugEmulatorEnabled =
     options.debugEmulatorEnabled ?? defaults.debugEmulatorEnabled ?? false;
   const desktopApp = options.desktopApp ?? false;
+  const appVersion = options.appVersion?.trim() || getPackageVersion();
+  const updater =
+    options.updater ??
+    createFallbackUpdater({
+      currentVersion: appVersion,
+    });
 
   const accessGuard = createAccessGuard(accessPassword);
   const storage = new AppStorage(dataDir, { directDataDir });
@@ -126,6 +133,7 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
     ffmpegAvailable: Boolean(resolvedFfmpegPath),
     debugEmulatorEnabled,
     desktopApp,
+    appVersion,
   };
 
   async function handleAuthExpired(): Promise<boolean> {
@@ -459,6 +467,7 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
             const accessUnlocked = accessGuard.isRequestAuthorized(req);
 
             if (!accessUnlocked) {
+              const currentUpdate = updater.getState();
               const lockedBootstrap: DashboardBootstrap = {
                 accessRequired,
                 accessUnlocked: false,
@@ -477,6 +486,12 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
                 media: [],
                 mediaDir: "",
                 capabilities,
+                updateState: {
+                  currentVersion: currentUpdate.currentVersion,
+                  phase: "idle",
+                  canAutoUpdate: currentUpdate.canAutoUpdate,
+                  releaseUrl: currentUpdate.releaseUrl,
+                },
               };
               return jsonOk(lockedBootstrap);
             }
@@ -497,6 +512,7 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
               media: storage.listMedia(),
               mediaDir: storage.mediaDir,
               capabilities,
+              updateState: updater.getState(),
             };
             return jsonOk(bootstrap);
           }
@@ -807,6 +823,21 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
             storage.saveWorkspace(workspace);
             streams.notifyGridSettingsChanged();
             return jsonOk({ settings: workspace.settings });
+          }
+
+          if (pathname === "/api/updates" && req.method === "GET") {
+            return jsonOk(updater.getState());
+          }
+
+          if (pathname === "/api/updates/check" && req.method === "POST") {
+            return jsonOk(await updater.checkForUpdate());
+          }
+
+          if (pathname === "/api/updates/apply" && req.method === "POST") {
+            if (!updater.applyUpdate) {
+              return jsonErr(tServer(reqLang, "update_auto_unsupported"), 400);
+            }
+            return jsonOk(await updater.applyUpdate());
           }
 
           const audioCfgMatch = pathname.match(/^\/api\/cameras\/([^/]+)\/audio-config$/);

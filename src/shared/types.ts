@@ -146,10 +146,33 @@ export interface MediaItem {
   createdAt: number;
 }
 
+export type AppUpdatePhase =
+  | "idle"
+  | "checking"
+  | "available"
+  | "up-to-date"
+  | "downloading"
+  | "ready"
+  | "applying"
+  | "error";
+
+export interface AppUpdateState {
+  currentVersion: string;
+  phase: AppUpdatePhase;
+  canAutoUpdate: boolean;
+  latestVersion?: string;
+  releaseUrl: string;
+  message?: string;
+  progress?: number;
+  checkedAt?: number;
+  error?: string;
+}
+
 export interface RuntimeCapabilities {
   ffmpegAvailable: boolean;
   debugEmulatorEnabled: boolean;
   desktopApp: boolean;
+  appVersion: string;
 }
 
 export interface DashboardBootstrap {
@@ -164,4 +187,5 @@ export interface DashboardBootstrap {
   media: MediaItem[];
   mediaDir: string;
   capabilities: RuntimeCapabilities;
+  updateState: AppUpdateState;
 }

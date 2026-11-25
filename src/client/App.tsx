@@ -59,6 +59,7 @@ import {
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import type {
+  AppUpdateState,
   AuthState,
   CameraMeta,
   CameraTelemetry,
@@ -91,6 +92,14 @@ const DEFAULT_CAPABILITIES: RuntimeCapabilities = {
   ffmpegAvailable: true,
   debugEmulatorEnabled: false,
   desktopApp: false,
+  appVersion: "0.1.0",
+};
+
+const DEFAULT_UPDATE_STATE: AppUpdateState = {
+  currentVersion: "0.1.0",
+  phase: "idle",
+  canAutoUpdate: false,
+  releaseUrl: "https://github.com/sabraman/tapo-admin/releases/latest",
 };
 
 export function App(): React.ReactElement {
@@ -99,6 +108,9 @@ export function App(): React.ReactElement {
   const [accessRequired, setAccessRequired] = useState(false);
   const [accessUnlocked, setAccessUnlocked] = useState(true);
   const [capabilities, setCapabilities] = useState<RuntimeCapabilities>(DEFAULT_CAPABILITIES);
+  const [updateState, setUpdateState] = useState<AppUpdateState>(DEFAULT_UPDATE_STATE);
+  const [initialUpdateCheckDone, setInitialUpdateCheckDone] = useState(false);
+  const [updateToastVersion, setUpdateToastVersion] = useState<string | null>(null);
   const [auth, setAuth] = useState<AuthState>({ status: "unauthenticated" });
   const [cameras, setCameras] = useState<CameraMeta[]>([]);
   const [stores, setStores] = useState<Store[]>([]);
@@ -131,7 +143,14 @@ export function App(): React.ReactElement {
       const data = await api<DashboardBootstrap>("/api/bootstrap");
       setAccessRequired(Boolean(data.accessRequired));
       setAccessUnlocked(Boolean(data.accessUnlocked));
-      setCapabilities(data.capabilities ?? DEFAULT_CAPABILITIES);
+      const caps = data.capabilities ?? DEFAULT_CAPABILITIES;
+      setCapabilities(caps);
+      setUpdateState(
+        data.updateState ?? {
+          ...DEFAULT_UPDATE_STATE,
+          currentVersion: caps.appVersion,
+        },
+      );
       setAuth(data.auth);
       setCameras(data.cameras);
       setStores(data.stores);
@@ -157,6 +176,77 @@ export function App(): React.ReactElement {
   useEffect(() => {
     void loadBootstrap();
   }, []);
+
+  async function checkUpdates(silent = false) {
+    if (!silent) {
+      setUpdateState((prev) => ({ ...prev, phase: "checking", error: undefined }));
+    }
+    try {
+      const next = await api<AppUpdateState>("/api/updates/check", { method: "POST" });
+      setUpdateState(next);
+      if (
+        silent &&
+        (next.phase === "available" || next.phase === "ready") &&
+        next.latestVersion &&
+        updateToastVersion !== next.latestVersion
+      ) {
+        setUpdateToastVersion(next.latestVersion);
+        let toastId = "";
+        toastId = toastManager.add({
+          title: t("updateAvailableToastTitle", { version: next.latestVersion }),
+          type: "info",
+          actionProps: {
+            children: t("updateAvailableToastAction"),
+            onClick: () => {
+              if (toastId) toastManager.close(toastId);
+              setSystemTab("account");
+              setSystemOpen(true);
+            },
+          },
+        });
+      }
+    } catch (err) {
+      if (!silent) {
+        setUpdateState((prev) => ({
+          ...prev,
+          phase: "error",
+          error: err instanceof Error ? err.message : String(err),
+        }));
+      }
+    }
+  }
+
+  async function applyUpdate() {
+    try {
+      const next = await api<AppUpdateState>("/api/updates/apply", { method: "POST" });
+      setUpdateState(next);
+    } catch (err) {
+      setUpdateState((prev) => ({
+        ...prev,
+        phase: "error",
+        error: err instanceof Error ? err.message : String(err),
+      }));
+    }
+  }
+
+  useEffect(() => {
+    if (!accessUnlocked || auth.status !== "authenticated" || initialUpdateCheckDone) return;
+    setInitialUpdateCheckDone(true);
+    void checkUpdates(true);
+  }, [accessUnlocked, auth.status, initialUpdateCheckDone]);
+
+  useEffect(() => {
+    if (!accessUnlocked) return;
+    if (updateState.phase !== "downloading" && updateState.phase !== "applying") return;
+    const timer = setInterval(() => {
+      void api<AppUpdateState>("/api/updates")
+        .then((next) => setUpdateState(next))
+        .catch(() => {
+          // Ignore transient disconnect while desktop app restarts to apply the update.
+        });
+    }, 450);
+    return () => clearInterval(timer);
+  }, [accessUnlocked, updateState.phase]);
 
   useEffect(() => {
     if (!accessUnlocked || auth.status !== "authenticated") return;
@@ -509,6 +599,12 @@ export function App(): React.ReactElement {
     setLogs([]);
     setMedia([]);
     setMediaDir("");
+    setUpdateState({
+      ...DEFAULT_UPDATE_STATE,
+      currentVersion: capabilities.appVersion,
+    });
+    setInitialUpdateCheckDone(false);
+    setUpdateToastVersion(null);
   }
 
   async function logout() {
@@ -908,6 +1004,9 @@ export function App(): React.ReactElement {
             >
               <Settings2Icon aria-hidden="true" />
               <span className="hidden sm:inline">{t("systemLabel")}</span>
+              {(updateState.phase === "available" || updateState.phase === "ready") && (
+                <span aria-hidden="true" className="size-2 rounded-full bg-info" />
+              )}
             </TooltipTrigger>
             <TooltipPopup>{t("systemTooltip")}</TooltipPopup>
           </Tooltip>
@@ -1036,6 +1135,8 @@ export function App(): React.ReactElement {
           setStoreDialogOpen(true);
         }}
         onLock={lockDashboard}
+        onApplyUpdate={applyUpdate}
+        onCheckUpdates={() => checkUpdates(false)}
         onLogout={logout}
         onOpenChange={setSystemOpen}
         onRefreshCameras={refreshCameras}
@@ -1044,6 +1145,7 @@ export function App(): React.ReactElement {
         settings={settings}
         stores={effectiveStores}
         telemetry={effectiveTelemetry}
+        updateState={updateState}
       />
 
       {/* Explicit Camera Edit Dialog (Save/Cancel dirty flow) */}

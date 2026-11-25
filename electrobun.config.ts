@@ -1,7 +1,12 @@
 import type { ElectrobunConfig } from "electrobun";
 import pkg from "./package.json" with { type: "json" };
 
-const releaseBaseUrl = process.env.ELECTROBUN_RELEASE_URL?.trim();
+const githubServer = (process.env.GITHUB_SERVER_URL?.trim() || "https://github.com").replace(/\/+$/, "");
+const githubRepo = process.env.GITHUB_REPOSITORY?.trim() || "sabraman/tapo-admin";
+const releaseBaseUrl =
+  process.env.ELECTROBUN_RELEASE_URL?.trim() || `${githubServer}/${githubRepo}/releases/latest/download`;
+const generatePatch =
+  process.env.ELECTROBUN_GENERATE_PATCH === "true" || process.env.CI === "true";
 
 export default {
   app: {
@@ -47,7 +52,7 @@ export default {
     postWrap: "./scripts/electrobun/post-wrap.ts",
   },
   release: {
-    generatePatch: Boolean(releaseBaseUrl),
-    ...(releaseBaseUrl ? { baseUrl: releaseBaseUrl } : {}),
+    baseUrl: releaseBaseUrl,
+    generatePatch,
   },
 } satisfies ElectrobunConfig;

@@ -60,9 +60,40 @@ Platform notes:
 
 ---
 
+## Updates & Releases
+
+### In-App Auto-Updates
+- **Desktop builds (macOS & Windows):** Packaged `stable` builds check `https://github.com/sabraman/tapo-admin/releases/latest/download` through Electrobun's built-in `Updater`. Trigger checks manually from **System → Account → Application & Updates** or the tray **Check for Updates** menu item, then click **Download & restart** to apply incremental `.patch` updates or bundle replacements.
+- **Web / Docker / Dev mode:** The dashboard checks GitHub Releases for newer tags, shows a notification when an update is available, and links to the release notes.
+
+### Publishing a Release
+Pushing a version tag matching `v*` (for example `v0.2.0`) triggers [`.github/workflows/release.yml`](.github/workflows/release.yml):
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The release workflow:
+1. Builds macOS & Windows desktop installers and Electrobun update manifests (`*-update.json`, `.patch`, and compressed bundles).
+2. Builds and pushes multi-arch Docker images (`linux/amd64`, `linux/arm64`) to `ghcr.io/sabraman/tapo-admin`.
+3. Publishes all desktop artifacts onto the GitHub Release page so existing desktop installations auto-update.
+
+---
+
 ## Docker Deployment
 
 The provided `Dockerfile` uses `oven/bun:1.3-alpine`, installs `ffmpeg`, builds the client bundle, and exposes port `3456` with a healthcheck against `/api/health`.
+
+### Using the Prebuilt GHCR Image
+
+```sh
+docker pull ghcr.io/sabraman/tapo-admin:latest
+# Or when using an image-based compose service:
+docker compose pull && docker compose up -d
+```
+
+### Building from Source
 
 ```sh
 cp .env.example .env
@@ -116,6 +147,8 @@ Leave `TAPO_ACCESS_PASSWORD` empty for local-only use or the desktop app.
 | `TAPO_DEBUG_EMULATOR` | `false` | Enables built-in mock cameras for testing without hardware. |
 | `FFMPEG_PATH` | `ffmpeg` | Path or command name for the FFmpeg binary. |
 | `TAPO_CERT_PATH` | `certs/tapo-cloud-roots.pem` | Path to Tapo Cloud root CA certificates. |
+| `TAPO_RELEASES_REPO` | `sabraman/tapo-admin` | GitHub `owner/repo` checked for new releases. |
+| `ELECTROBUN_RELEASE_URL` | GitHub latest release download URL | Override Electrobun updater base URL when building desktop installers. |
 
 ---
 

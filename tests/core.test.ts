@@ -10,6 +10,11 @@ import { MulawTsExtractor } from "../src/server/mulaw-extractor";
 import { AppStorage } from "../src/server/storage";
 import { attachSocketInactivityTimeout, createRelayPartDemuxer, TapoTalkEncoder } from "../src/server/tapo-cloud";
 import { TsGopBuffer } from "../src/server/ts-gop-buffer";
+import {
+  compareSemver,
+  createFallbackUpdater,
+  normalizeReleaseRepo,
+} from "../src/server/updater";
 import { groupHealthMeta, isCameraOnline } from "../src/client/lib/api";
 import { encodeFloat32ToAlaw8k, linearToAlaw } from "../src/client/lib/audio";
 import {
@@ -29,7 +34,7 @@ import {
   SERVER_MESSAGES,
   tServer,
 } from "../src/shared/i18n";
-import type { CameraMeta, CameraTelemetry, DashboardBootstrap } from "../src/shared/types";
+import type { AppUpdateState, CameraMeta, CameraTelemetry, DashboardBootstrap } from "../src/shared/types";
 
 describe("AppStorage", () => {
   test("persists terminal uuid and session with 0600 permissions", () => {
@@ -530,6 +535,173 @@ describe("i18n, access guard, config & server", () => {
       });
       expect(lockRes.status).toBe(200);
       expect(lockRes.headers.get("set-cookie")).toContain("Max-Age=0");
+    } finally {
+      running.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Updater & Release Helpers", () => {
+  test("compares semver versions including prereleases and v prefixes", () => {
+    expect(compareSemver("v0.2.0", "0.1.9")).toBe(1);
+    expect(compareSemver("0.1.0", "v0.1.0")).toBe(0);
+    expect(compareSemver("0.1.0", "0.1.1")).toBe(-1);
+    expect(compareSemver("1.0.0", "1.0.0-beta.1")).toBe(1);
+    expect(compareSemver("1.0.0-alpha.2", "1.0.0-alpha.10")).toBe(-1);
+  });
+
+  test("normalizes release repositories with safe default fallback", () => {
+    expect(normalizeReleaseRepo("https://github.com/octo/repo.git")).toBe("octo/repo");
+    expect(normalizeReleaseRepo("/sabraman/tapo-admin/")).toBe("sabraman/tapo-admin");
+    expect(normalizeReleaseRepo("invalid")).toBe("sabraman/tapo-admin");
+    expect(normalizeReleaseRepo("")).toBe("sabraman/tapo-admin");
+  });
+
+  test("createFallbackUpdater handles 404, newer releases, up-to-date, and network errors", async () => {
+    const u404 = createFallbackUpdater({
+      currentVersion: "0.1.0",
+      fetchImpl: (async () => new Response("Not Found", { status: 404 })) as unknown as typeof fetch,
+    });
+    const res404 = await u404.checkForUpdate();
+    expect(res404.phase).toBe("up-to-date");
+    expect(res404.canAutoUpdate).toBe(false);
+    expect(res404.latestVersion).toBe("0.1.0");
+
+    const uNewer = createFallbackUpdater({
+      currentVersion: "0.1.0",
+      fetchImpl: (async () =>
+        Response.json({
+          tag_name: "v0.2.0",
+          html_url: "https://github.com/sabraman/tapo-admin/releases/tag/v0.2.0",
+        })) as unknown as typeof fetch,
+    });
+    const resNewer = await uNewer.checkForUpdate();
+    expect(resNewer.phase).toBe("available");
+    expect(resNewer.latestVersion).toBe("0.2.0");
+    expect(resNewer.canAutoUpdate).toBe(false);
+    expect(resNewer.releaseUrl).toBe("https://github.com/sabraman/tapo-admin/releases/tag/v0.2.0");
+
+    const uSame = createFallbackUpdater({
+      currentVersion: "0.2.0",
+      fetchImpl: (async () =>
+        Response.json({
+          tag_name: "v0.2.0",
+          html_url: "https://github.com/sabraman/tapo-admin/releases/tag/v0.2.0",
+        })) as unknown as typeof fetch,
+    });
+    const resSame = await uSame.checkForUpdate();
+    expect(resSame.phase).toBe("up-to-date");
+
+    const uErr = createFallbackUpdater({
+      currentVersion: "0.1.0",
+      fetchImpl: (async () => new Response("Server Error", { status: 500 })) as unknown as typeof fetch,
+    });
+    const resErr = await uErr.checkForUpdate();
+    expect(resErr.phase).toBe("error");
+    expect(resErr.error).toContain("HTTP 500");
+  });
+
+  test("server update endpoints respect access guard and updater bridge", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tapo-updater-server-"));
+    let state: AppUpdateState = {
+      currentVersion: "0.1.0",
+      phase: "idle",
+      canAutoUpdate: true,
+      releaseUrl: "https://github.com/sabraman/tapo-admin/releases/latest",
+    };
+
+    const mockUpdater = {
+      getState: () => ({ ...state }),
+      checkForUpdate: async () => {
+        state = {
+          ...state,
+          phase: "available",
+          latestVersion: "0.2.0",
+          checkedAt: Date.now(),
+        };
+        return { ...state };
+      },
+      applyUpdate: async () => {
+        state = {
+          ...state,
+          phase: "downloading",
+          progress: 25,
+        };
+        return { ...state };
+      },
+    };
+
+    const running = startTapoServer({
+      hostname: "127.0.0.1",
+      port: 0,
+      dataDir: dir,
+      directDataDir: true,
+      accessPassword: "gate-password",
+      appVersion: "0.1.0",
+      updater: mockUpdater,
+    });
+
+    try {
+      const blocked = await fetch(`${running.url}/api/updates`);
+      expect(blocked.status).toBe(401);
+
+      const bootLockedRes = await fetch(`${running.url}/api/bootstrap`);
+      const bootLocked = (await bootLockedRes.json()) as DashboardBootstrap;
+      expect(bootLocked.capabilities.appVersion).toBe("0.1.0");
+      expect(bootLocked.updateState.phase).toBe("idle");
+
+      const unlockRes = await fetch(`${running.url}/api/access/unlock`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: "gate-password" }),
+      });
+      const cookie = unlockRes.headers.get("set-cookie")!.split(";")[0]!;
+
+      const checkRes = await fetch(`${running.url}/api/updates/check`, {
+        method: "POST",
+        headers: { cookie },
+      });
+      expect(checkRes.status).toBe(200);
+      const checked = (await checkRes.json()) as AppUpdateState;
+      expect(checked.phase).toBe("available");
+      expect(checked.latestVersion).toBe("0.2.0");
+
+      const applyRes = await fetch(`${running.url}/api/updates/apply`, {
+        method: "POST",
+        headers: { cookie },
+      });
+      expect(applyRes.status).toBe(200);
+      const applied = (await applyRes.json()) as AppUpdateState;
+      expect(applied.phase).toBe("downloading");
+      expect(applied.progress).toBe(25);
+    } finally {
+      running.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("server returns 400 when auto-update apply is unsupported in fallback mode", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tapo-updater-fallback-"));
+    const running = startTapoServer({
+      hostname: "127.0.0.1",
+      port: 0,
+      dataDir: dir,
+      directDataDir: true,
+      updater: createFallbackUpdater({
+        currentVersion: "0.1.0",
+        fetchImpl: (async () => new Response("Not Found", { status: 404 })) as unknown as typeof fetch,
+      }),
+    });
+
+    try {
+      const res = await fetch(`${running.url}/api/updates/apply`, {
+        method: "POST",
+        headers: { "X-Tapo-Lang": "en" },
+      });
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error?: string };
+      expect(body.error).toBe(tServer("en", "update_auto_unsupported"));
     } finally {
       running.stop();
       rmSync(dir, { recursive: true, force: true });

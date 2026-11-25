@@ -1,6 +1,9 @@
 import {
   ActivityIcon,
   AlertTriangleIcon,
+  ArrowUpCircleIcon,
+  DownloadIcon,
+  ExternalLinkIcon,
   LockIcon,
   LogOutIcon,
   PencilIcon,
@@ -61,6 +64,7 @@ import { cameraLabel, findCameraStore, isCameraOnline } from "@/lib/api";
 import { formatRelayLog, formatTsTime, relayStatusMeta, useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import type {
+  AppUpdateState,
   AuthState,
   CameraMeta,
   CameraTelemetry,
@@ -277,6 +281,7 @@ interface SystemSettingsDialogProps {
   settings: DashboardSettings;
   logs: RelayEventLog[];
   capabilities?: RuntimeCapabilities;
+  updateState?: AppUpdateState;
   accessRequired?: boolean;
   onOpenChange: (open: boolean) => void;
   onSaveSettings: (next: DashboardSettings) => Promise<void>;
@@ -285,6 +290,8 @@ interface SystemSettingsDialogProps {
   onDeleteStore: (store: Store) => Promise<void>;
   onEditCamera: (cam: CameraMeta) => void;
   onRefreshCameras: () => Promise<void>;
+  onCheckUpdates?: () => Promise<void>;
+  onApplyUpdate?: () => Promise<void>;
   onLock?: () => Promise<void>;
   onLogout: () => Promise<void>;
 }
@@ -299,6 +306,7 @@ export function SystemSettingsDialog({
   settings,
   logs,
   capabilities,
+  updateState,
   accessRequired = false,
   onOpenChange,
   onSaveSettings,
@@ -307,9 +315,13 @@ export function SystemSettingsDialog({
   onDeleteStore,
   onEditCamera,
   onRefreshCameras,
+  onCheckUpdates,
+  onApplyUpdate,
   onLock,
   onLogout,
 }: SystemSettingsDialogProps): React.ReactElement {
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [applyingUpdate, setApplyingUpdate] = useState(false);
   const { lang, setLanguagePref, t } = useI18n();
   const [tab, setTab] = useState<"stream" | "stores" | "diagnostics" | "account">(initialTab);
   const [draft, setDraft] = useState<DashboardSettings>(settings);
@@ -850,6 +862,162 @@ export function SystemSettingsDialog({
                         <LogOutIcon aria-hidden="true" />
                         <span>{t("logoutButton")}</span>
                       </Button>
+                    </div>
+                  </CardPanel>
+                </Card>
+
+                <Card>
+                  <CardPanel className="flex flex-col gap-3 p-4">
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div className="flex items-start gap-2.5">
+                        <ArrowUpCircleIcon
+                          aria-hidden="true"
+                          className="mt-0.5 size-4 shrink-0 text-muted-foreground"
+                        />
+                        <div className="flex flex-col gap-0.5">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-medium text-sm">{t("updateCardTitle")}</span>
+                            <Badge size="sm" variant="secondary">
+                              {capabilities?.desktopApp
+                                ? t("updateModeDesktop")
+                                : t("updateModeServer")}
+                            </Badge>
+                          </div>
+                          <span className="text-muted-foreground text-xs">
+                            {t("updateCurrentVersion", {
+                              version:
+                                updateState?.currentVersion ?? capabilities?.appVersion ?? "0.1.0",
+                            })}
+                          </span>
+                        </div>
+                      </div>
+
+                      {(() => {
+                        const phase = updateState?.phase ?? "idle";
+                        if (phase === "up-to-date") {
+                          return <Badge variant="success">{t("updateStatusUpToDate")}</Badge>;
+                        }
+                        if (phase === "available") {
+                          return (
+                            <Badge variant="info">
+                              {t("updateStatusAvailable", {
+                                version: updateState?.latestVersion ?? "",
+                              })}
+                            </Badge>
+                          );
+                        }
+                        if (phase === "downloading") {
+                          const label =
+                            typeof updateState?.progress === "number"
+                              ? t("updateStatusDownloadingPct", {
+                                  pct: Math.round(updateState.progress),
+                                })
+                              : t("updateStatusDownloading");
+                          return <Badge variant="warning">{label}</Badge>;
+                        }
+                        if (phase === "ready") {
+                          return (
+                            <Badge variant="success">
+                              {t("updateStatusReady", {
+                                version: updateState?.latestVersion ?? "",
+                              })}
+                            </Badge>
+                          );
+                        }
+                        if (phase === "applying") {
+                          return <Badge variant="warning">{t("updateStatusApplying")}</Badge>;
+                        }
+                        if (phase === "checking") {
+                          return <Badge variant="secondary">{t("updateStatusChecking")}</Badge>;
+                        }
+                        if (phase === "error") {
+                          return <Badge variant="error">{t("updateStatusError")}</Badge>;
+                        }
+                        return <Badge variant="outline">{t("updateStatusIdle")}</Badge>;
+                      })()}
+                    </div>
+
+                    {updateState?.phase === "downloading" && (
+                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                        <div
+                          className="h-full rounded-full bg-primary transition-all duration-300"
+                          style={{
+                            width: `${Math.max(6, Math.min(100, Math.round(updateState.progress ?? 0)))}%`,
+                          }}
+                        />
+                      </div>
+                    )}
+
+                    {updateState?.phase === "error" && updateState.error && (
+                      <Alert variant="error">
+                        <AlertTriangleIcon aria-hidden="true" />
+                        <AlertTitle>{t("updateStatusError")}</AlertTitle>
+                        <AlertDescription>{updateState.error}</AlertDescription>
+                      </Alert>
+                    )}
+
+                    {!capabilities?.desktopApp &&
+                      (updateState?.phase === "available" || updateState?.phase === "ready") && (
+                        <div className="flex flex-col gap-1 rounded-md border bg-muted/40 px-3 py-2">
+                          <span className="font-medium text-muted-foreground text-xs">
+                            {t("updateDockerHint")}
+                          </span>
+                          <code className="select-all font-mono text-xs">
+                            docker compose pull &amp;&amp; docker compose up -d
+                          </code>
+                        </div>
+                      )}
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      {onCheckUpdates && (
+                        <Button
+                          disabled={
+                            checkingUpdates ||
+                            applyingUpdate ||
+                            updateState?.phase === "checking" ||
+                            updateState?.phase === "downloading" ||
+                            updateState?.phase === "applying"
+                          }
+                          loading={checkingUpdates || updateState?.phase === "checking"}
+                          onClick={() => {
+                            setCheckingUpdates(true);
+                            void onCheckUpdates().finally(() => setCheckingUpdates(false));
+                          }}
+                          variant="outline"
+                        >
+                          <RefreshCwIcon aria-hidden="true" />
+                          <span>{t("updateCheckButton")}</span>
+                        </Button>
+                      )}
+
+                      {updateState?.canAutoUpdate &&
+                        (updateState.phase === "available" || updateState.phase === "ready") &&
+                        onApplyUpdate && (
+                          <Button
+                            disabled={applyingUpdate || checkingUpdates}
+                            loading={applyingUpdate}
+                            onClick={() => {
+                              setApplyingUpdate(true);
+                              void onApplyUpdate().finally(() => setApplyingUpdate(false));
+                            }}
+                            variant="default"
+                          >
+                            <DownloadIcon aria-hidden="true" />
+                            <span>{t("updateInstallButton")}</span>
+                          </Button>
+                        )}
+
+                      {updateState?.releaseUrl && (
+                        <Button
+                          render={
+                            <a href={updateState.releaseUrl} rel="noreferrer" target="_blank" />
+                          }
+                          variant="ghost"
+                        >
+                          <ExternalLinkIcon aria-hidden="true" />
+                          <span>{t("updateOpenRelease")}</span>
+                        </Button>
+                      )}
                     </div>
                   </CardPanel>
                 </Card>

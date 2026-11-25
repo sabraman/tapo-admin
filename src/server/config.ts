@@ -1,5 +1,6 @@
 import { existsSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import type { AppUpdaterBridge } from "./updater";
 
 export interface StartTapoServerOptions {
   hostname?: string;
@@ -14,6 +15,8 @@ export interface StartTapoServerOptions {
   accessPassword?: string;
   debugEmulatorEnabled?: boolean;
   desktopApp?: boolean;
+  appVersion?: string;
+  updater?: AppUpdaterBridge;
 }
 
 export interface RunningTapoServer {

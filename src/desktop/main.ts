@@ -9,6 +9,7 @@ import Electrobun, {
 } from "electrobun/main";
 import { startTapoServer } from "../server/app";
 import { resolveRuntimeServerConfig } from "../server/config";
+import { createDesktopUpdaterBridge } from "./updater";
 
 function resolveExistingPath(candidates: string[], fallback: string): string {
   for (const candidate of candidates) {
@@ -35,6 +36,7 @@ const bundledFfmpegPath = join(PATHS.RESOURCES_FOLDER, "app", "bin", ffmpegName)
 const ffmpegPath = existsSync(bundledFfmpegPath) ? bundledFfmpegPath : "ffmpeg";
 
 const runtimeConfig = resolveRuntimeServerConfig();
+const desktopUpdater = createDesktopUpdaterBridge();
 
 const running = startTapoServer({
   hostname: "127.0.0.1",
@@ -47,6 +49,7 @@ const running = startTapoServer({
   development: false,
   desktopApp: true,
   debugEmulatorEnabled: Boolean(runtimeConfig.debugEmulatorEnabled),
+  updater: desktopUpdater,
 });
 
 ApplicationMenu.setApplicationMenu([
@@ -128,6 +131,7 @@ const tray = new Tray({
 
 tray.setMenu([
   { type: "normal", label: "Show Window", action: "show-window" },
+  { type: "normal", label: "Check for Updates", action: "check-updates" },
   { type: "separator" },
   { type: "normal", label: "Quit", action: "quit" },
 ]);
@@ -155,6 +159,17 @@ tray.on("tray-clicked", (event: unknown) => {
     stopServerOnce();
     Utils.quit();
     return;
+  }
+
+  if (action === "check-updates") {
+    void desktopUpdater.checkForUpdate().then((res) => {
+      if (res.phase === "available" || res.phase === "ready") {
+        Utils.showNotification({
+          title: "Tapo Admin",
+          body: `Update v${res.latestVersion ?? ""} is available in System → Account.`,
+        });
+      }
+    });
   }
 
   if (!mainWindow) {

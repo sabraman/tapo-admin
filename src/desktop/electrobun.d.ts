@@ -195,10 +195,78 @@ declare module "electrobun/main" {
     readonly VIEWS_FOLDER: string;
   };
 
+  export interface UpdateStatusDetails {
+    fromHash?: string;
+    toHash?: string;
+    currentHash?: string;
+    latestHash?: string;
+    patchNumber?: number;
+    totalPatchesApplied?: number;
+    progress?: number;
+    bytesDownloaded?: number;
+    totalBytes?: number;
+    usedPatchPath?: boolean;
+    errorMessage?: string;
+    url?: string;
+    zstdPath?: string;
+    exitCode?: number | null;
+  }
+
+  export interface UpdateStatusEntry {
+    status: string;
+    message: string;
+    timestamp: number;
+    details?: UpdateStatusDetails;
+  }
+
+  export interface LocalUpdateInfo {
+    version: string;
+    hash: string;
+    baseUrl: string;
+    channel: string;
+    name: string;
+    displayName?: string;
+    identifier: string;
+    updateAuthority?: "direct" | "external" | "none";
+  }
+
+  export interface UpdateInfo {
+    version: string;
+    hash: string;
+    updateAvailable: boolean;
+    updateReady: boolean;
+    error: string;
+  }
+
+  export const Updater: {
+    updateInfo: () => UpdateInfo;
+    getStatusHistory: () => UpdateStatusEntry[];
+    clearStatusHistory: () => void;
+    onStatusChange: (listener: ((entry: UpdateStatusEntry) => void) | null) => void;
+    checkForUpdate: () => Promise<UpdateInfo>;
+    downloadUpdate: () => Promise<void>;
+    applyUpdate: () => Promise<void>;
+    getLocalInfo: () => Promise<LocalUpdateInfo>;
+    localInfo: {
+      version: () => Promise<string>;
+      hash: () => Promise<string>;
+      channel: () => Promise<string>;
+      baseUrl: () => Promise<string>;
+    };
+  };
+
+  export interface NotificationOptions {
+    title: string;
+    body?: string;
+    subtitle?: string;
+    silent?: boolean;
+  }
+
   export const Utils: {
     quit: (code?: number) => boolean;
     openExternal: (url: string) => boolean;
     openPath: (path: string) => boolean;
+    showNotification: (options: NotificationOptions) => void;
     paths: {
       readonly home: string;
       readonly appData: string;
@@ -225,6 +293,7 @@ declare module "electrobun/main" {
     };
     BrowserWindow: typeof BrowserWindow;
     Tray: typeof Tray;
+    Updater: typeof Updater;
     Utils: typeof Utils;
     ApplicationMenu: typeof ApplicationMenu;
     PATHS: typeof PATHS;
