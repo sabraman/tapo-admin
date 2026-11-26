@@ -1345,12 +1345,18 @@ describe("SD events, record plan, SD info & audio muxing", () => {
       const fakeBinContent = Buffer.from("#!/bin/sh\necho ffmpeg version 6.1.1\n", "utf8");
       const gzPayload = gzipSync(fakeBinContent);
 
+      const testPlatform = process.platform === "win32" ? "win32" : "darwin";
+      const testArch = process.platform === "win32" ? "x64" : "arm64";
+      const expectedAsset =
+        testPlatform === "win32" ? "/ffmpeg-win32-x64.gz" : "/ffmpeg-darwin-arm64.gz";
+      const expectedBin = join(binDir, testPlatform === "win32" ? "ffmpeg.exe" : "ffmpeg");
+
       let requestedUrl = "";
       let currentPath: string | null = null;
       const installer = createFfmpegInstaller({
         installDir: binDir,
-        platform: "darwin",
-        arch: "arm64",
+        platform: testPlatform,
+        arch: testArch,
         resolveExisting: () => currentPath,
         verifyBinary: (p) => readFileSync(p).equals(fakeBinContent),
         fetchImpl: (async (url: string | URL | Request) => {
@@ -1372,12 +1378,12 @@ describe("SD events, record plan, SD info & audio muxing", () => {
       });
 
       const [res1, res2] = await Promise.all([installer.install(), installer.install()]);
-      expect(requestedUrl).toEndWith("/ffmpeg-darwin-arm64.gz");
+      expect(requestedUrl).toEndWith(expectedAsset);
       expect(res1.phase).toBe("ready");
       expect(res1.available).toBe(true);
       expect(res2.binaryPath).toBe(res1.binaryPath);
-      expect(res1.binaryPath).toBe(join(binDir, "ffmpeg"));
-      expect(findFfmpegBinary(undefined, [binDir])).toBe(join(binDir, "ffmpeg"));
+      expect(res1.binaryPath).toBe(expectedBin);
+      expect(findFfmpegBinary(undefined, [binDir])).toBe(expectedBin);
 
       // Failed download cleans up temp files and reports error state
       const badDir = join(dir, "bad-bin");
