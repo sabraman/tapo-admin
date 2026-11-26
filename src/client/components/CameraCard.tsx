@@ -4,6 +4,7 @@ import {
   MicIcon,
   MicOffIcon,
   PencilIcon,
+  RotateCwIcon,
   Volume2Icon,
   VolumeXIcon,
 } from "lucide-react";
@@ -70,8 +71,10 @@ export function CameraCard({
           className={fillHeight ? "h-full w-full aspect-auto" : undefined}
           deviceId={camera.deviceId}
           lastError={telemetry?.lastError}
+          mirrorDeviceId={camera.mirrorSourceDeviceId}
           online={camera.accessPlatform === "IOT" || online}
           quality="grid"
+          rotate180={Boolean(camera.orientation?.rotate180)}
           targetFps={settings.gridFps}
           telemetryStatus={telemetry?.status}
           transport={settings.gridTransport}
@@ -90,6 +93,17 @@ export function CameraCard({
           {isSim && (
             <Badge className="bg-amber-500/20 text-amber-300" size="sm" variant="secondary">
               {t("simBadge")}
+            </Badge>
+          )}
+          {camera.orientation?.rotate180 && (
+            <Badge
+              className="gap-1 bg-white/12 text-white/90"
+              size="sm"
+              title={t("cameraOrientationRotate180Label")}
+              variant="secondary"
+            >
+              <RotateCwIcon aria-hidden="true" className="size-2.5" />
+              <span>{t("flipped180Badge")}</span>
             </Badge>
           )}
           {showStoreBadge && storeName && (

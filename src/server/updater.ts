@@ -10,7 +10,7 @@ export interface AppUpdaterBridge {
 }
 
 export function getPackageVersion(): string {
-  return typeof pkg.version === "string" && pkg.version.trim() ? pkg.version.trim() : "0.1.0";
+  return typeof pkg.version === "string" && pkg.version.trim() ? pkg.version.trim() : "0.2.0";
 }
 
 export function normalizeReleaseRepo(raw?: string): string {

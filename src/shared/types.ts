@@ -32,6 +32,11 @@ export interface Store {
   source?: "cloud" | "local";
 }
 
+export interface CameraOrientation {
+  rotate180?: boolean;
+  invertPtz?: boolean;
+}
+
 export interface CameraMeta {
   deviceId: string;
   alias: string;
@@ -39,6 +44,9 @@ export interface CameraMeta {
   cloudNickname?: string;
   familyId?: string;
   roomId?: string;
+  orientation?: CameraOrientation;
+  /** Debug emulator only: real camera deviceId whose live video stream is mirrored. */
+  mirrorSourceDeviceId?: string;
   deviceModel: string;
   deviceName: string;
   deviceHwVer: string;
@@ -78,6 +86,20 @@ export interface CameraTelemetry {
   lastError: string | null;
 }
 
+export interface SdCardDetails {
+  status: string;
+  totalSpace?: string;
+  freeSpace?: string;
+  percent?: number;
+  rwAttr?: string;
+  loopRecordEnabled?: boolean;
+}
+
+export interface CameraPreset {
+  id: string;
+  name: string;
+}
+
 export interface CameraCapabilitySnapshot {
   deviceId: string;
   online: boolean;
@@ -85,15 +107,32 @@ export interface CameraCapabilitySnapshot {
   ptzSupported: boolean;
   sdStatus: "ready" | "missing_or_unformatted" | "unknown";
   sdErrorCode?: number;
+  sdCard?: SdCardDetails;
   cameraTime?: string;
   resolutions?: string[];
   encodeTypes?: string[];
   micVolume?: number;
   micMuted?: boolean;
   speakerVolume?: number;
+  alarmEnabled?: boolean;
+  presets?: CameraPreset[];
   lastCheckedAt: number;
   error?: string;
 }
+
+export type DetectionEventKind =
+  | "motion"
+  | "person"
+  | "tamper"
+  | "baby_cry"
+  | "line_crossing"
+  | "intrusion"
+  | "vehicle"
+  | "pet"
+  | "sound"
+  | "continuous"
+  | "event"
+  | "unknown";
 
 export interface RecordingClip {
   start: number;
@@ -102,12 +141,133 @@ export interface RecordingClip {
   type: number;
   startLocal: string;
   endLocal: string;
+  source?: "event" | "segment";
+  eventKinds?: DetectionEventKind[];
+  alarmType?: number;
+  eventsBitmask?: number;
 }
 
 export interface RecordingDayResponse {
   date: string;
   timezone: string;
   clips: RecordingClip[];
+  eventsCount?: number;
+  segmentsCount?: number;
+}
+
+export type RecordPlanDayKey =
+  | "monday"
+  | "tuesday"
+  | "wednesday"
+  | "thursday"
+  | "friday"
+  | "saturday"
+  | "sunday";
+
+export interface RecordPlanSegment {
+  start: string;
+  end: string;
+  mode: 1 | 2;
+}
+
+export interface CameraRecordPlan {
+  supported: boolean;
+  enabled: boolean;
+  days: Record<RecordPlanDayKey, RecordPlanSegment[]>;
+}
+
+export type DetectionSensitivity = "low" | "normal" | "high";
+export type DayNightMode = "auto" | "on" | "off";
+export type AlarmVolume = "low" | "normal" | "high";
+export type RebootScheduleDay =
+  | "everyday"
+  | "monday"
+  | "tuesday"
+  | "wednesday"
+  | "thursday"
+  | "friday"
+  | "saturday"
+  | "sunday";
+
+export interface CameraAlarmConfig {
+  supported: boolean;
+  enabled: boolean;
+  alarmMode: string[];
+  alarmType: string;
+  alarmVolume: AlarmVolume;
+  alarmDuration: number;
+  sirenTypes: string[];
+  sirenStatus?: "on" | "off";
+}
+
+export interface CameraRebootSchedule {
+  supported: boolean;
+  enabled: boolean;
+  time: string;
+  day: RebootScheduleDay;
+  randomRange?: number;
+}
+
+export interface CameraSettingsSnapshot {
+  deviceId: string;
+  online: boolean;
+  speakerVolume?: number;
+  micVolume?: number;
+  micMuted?: boolean;
+  sdCard?: SdCardDetails;
+  alarm: CameraAlarmConfig;
+  rebootSchedule: CameraRebootSchedule;
+  recordPlan: CameraRecordPlan;
+  dayNightMode?: DayNightMode;
+  imageFlip?: boolean;
+  ledEnabled?: boolean;
+  autoTracking?: boolean;
+  motionDetection?: {
+    supported: boolean;
+    enabled: boolean;
+    sensitivity: DetectionSensitivity;
+  };
+  personDetection?: {
+    supported: boolean;
+    enabled: boolean;
+    sensitivity: DetectionSensitivity;
+  };
+  presets: CameraPreset[];
+  lastCheckedAt: number;
+}
+
+export interface CameraSettingsPatch {
+  speakerVolume?: number;
+  micVolume?: number;
+  micMuted?: boolean;
+  alarm?: {
+    enabled?: boolean;
+    alarmMode?: string[];
+    alarmType?: string;
+    alarmVolume?: AlarmVolume;
+    alarmDuration?: number;
+  };
+  rebootSchedule?: {
+    enabled: boolean;
+    time: string;
+    day: RebootScheduleDay;
+  };
+  recordPlan?: {
+    enabled: boolean;
+    days: Record<RecordPlanDayKey, RecordPlanSegment[]>;
+  };
+  dayNightMode?: DayNightMode;
+  imageFlip?: boolean;
+  ledEnabled?: boolean;
+  autoTracking?: boolean;
+  motionDetection?: {
+    enabled?: boolean;
+    sensitivity?: DetectionSensitivity;
+  };
+  personDetection?: {
+    enabled?: boolean;
+    sensitivity?: DetectionSensitivity;
+  };
 }
 
 export interface RelayEventLog {
@@ -168,8 +328,22 @@ export interface AppUpdateState {
   error?: string;
 }
 
+export type FfmpegInstallPhase = "idle" | "downloading" | "verifying" | "ready" | "error";
+
+export interface FfmpegInstallState {
+  phase: FfmpegInstallPhase;
+  available: boolean;
+  supported: boolean;
+  binaryPath?: string;
+  progress?: number;
+  bytesReceived?: number;
+  bytesTotal?: number;
+  error?: string;
+}
+
 export interface RuntimeCapabilities {
   ffmpegAvailable: boolean;
+  ffmpegInstall?: FfmpegInstallState;
   debugEmulatorEnabled: boolean;
   desktopApp: boolean;
   appVersion: string;

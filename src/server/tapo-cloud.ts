@@ -3,11 +3,25 @@ import { readFileSync } from "node:fs";
 import tls from "node:tls";
 import { DEVICE_ERROR_KEYS, type ServerMessageKey, tServer } from "../shared/i18n";
 import type {
+  AlarmVolume,
+  CameraAlarmConfig,
   CameraCapabilitySnapshot,
   CameraMeta,
+  CameraPreset,
+  CameraRebootSchedule,
+  CameraRecordPlan,
+  CameraSettingsPatch,
+  CameraSettingsSnapshot,
+  DayNightMode,
+  DetectionEventKind,
+  DetectionSensitivity,
+  RebootScheduleDay,
   RecordingClip,
   RecordingDayResponse,
+  RecordPlanDayKey,
+  RecordPlanSegment,
   ResolvedLanguage,
+  SdCardDetails,
   StreamQuality,
 } from "../shared/types";
 
@@ -94,11 +108,353 @@ function formatWithOffset(epochSec: number, offsetMs: number): string {
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 
+export const RECORD_PLAN_DAYS: readonly RecordPlanDayKey[] = [
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday",
+  "sunday",
+];
+
+export function dayRangeUtcSec(dateYmd: string, offsetMs: number): { startSec: number; endSec: number } {
+  const clean = dateYmd.replaceAll("-", "");
+  const y = Number(clean.slice(0, 4));
+  const m = Number(clean.slice(4, 6));
+  const d = Number(clean.slice(6, 8));
+  if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d) || clean.length !== 8) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    return { startSec: nowSec - 86400, endSec: nowSec };
+  }
+  const offsetSec = Math.trunc(offsetMs / 1000);
+  const startSec = Math.floor(Date.UTC(y, m - 1, d, 0, 0, 0) / 1000) - offsetSec;
+  return { startSec, endSec: startSec + 86399 };
+}
+
+function unwrapTapoListEntries(rawList: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(rawList)) return [];
+  const items: Array<Record<string, unknown>> = [];
+  for (const entry of rawList) {
+    if (!entry || typeof entry !== "object") continue;
+    const rec = entry as Record<string, unknown>;
+    if (
+      "startTime" in rec ||
+      "start_time" in rec ||
+      "endTime" in rec ||
+      "end_time" in rec
+    ) {
+      items.push(rec);
+      continue;
+    }
+    for (const val of Object.values(rec)) {
+      if (val && typeof val === "object") {
+        items.push(val as Record<string, unknown>);
+      }
+    }
+  }
+  return items;
+}
+
+const ALARM_TYPE_KIND_MAP: Record<number, DetectionEventKind> = {
+  1: "continuous",
+  2: "motion",
+  3: "tamper",
+  4: "line_crossing",
+  5: "intrusion",
+  6: "person",
+  7: "baby_cry",
+  8: "vehicle",
+  9: "pet",
+  10: "event",
+  11: "sound",
+  12: "sound",
+};
+
+export function decodeDetectionEventKinds(item: Record<string, unknown>): {
+  kinds: DetectionEventKind[];
+  alarmType?: number;
+  bitmask?: number;
+} {
+  const kinds: DetectionEventKind[] = [];
+  const addKind = (k: DetectionEventKind) => {
+    if (!kinds.includes(k)) kinds.push(k);
+  };
+
+  const rawAlarmType = item.alarm_type ?? item.alarmType ?? item.type;
+  const alarmType =
+    rawAlarmType !== undefined && rawAlarmType !== null && Number.isFinite(Number(rawAlarmType))
+      ? Number(rawAlarmType)
+      : undefined;
+
+  let bitmask: number | undefined;
+  const rawEvents1 = item.events_1;
+  if (typeof rawEvents1 === "number" && Number.isFinite(rawEvents1)) {
+    bitmask = rawEvents1;
+  } else if (typeof rawEvents1 === "string" && /^\d+$/.test(rawEvents1)) {
+    bitmask = Number(rawEvents1);
+  } else if (rawEvents1 && typeof rawEvents1 === "object") {
+    const obj = rawEvents1 as Record<string, unknown>;
+    if (obj.value !== undefined && Number.isFinite(Number(obj.value))) {
+      bitmask = Number(obj.value);
+    }
+    if (typeof obj.type === "string") {
+      const t = obj.type.toLowerCase();
+      if (t.includes("person")) addKind("person");
+      else if (t.includes("motion")) addKind("motion");
+      else if (t.includes("tamper")) addKind("tamper");
+      else if (t.includes("line")) addKind("line_crossing");
+      else if (t.includes("intrusion")) addKind("intrusion");
+      else if (t.includes("vehicle")) addKind("vehicle");
+      else if (t.includes("pet")) addKind("pet");
+      else if (t.includes("cry")) addKind("baby_cry");
+    }
+  }
+
+  if (bitmask !== undefined) {
+    if (bitmask & 524288) addKind("person");
+    if (bitmask & 256) addKind("line_crossing");
+    if (bitmask & 2) addKind("motion");
+    if (bitmask & 32 && kinds.length === 0) addKind("vehicle");
+  }
+
+  if (alarmType !== undefined && alarmType in ALARM_TYPE_KIND_MAP) {
+    addKind(ALARM_TYPE_KIND_MAP[alarmType]!);
+  }
+
+  if (kinds.length === 0) {
+    addKind("event");
+  }
+  return { kinds, alarmType, bitmask };
+}
+
+export function parseDetectionListEntries(rawList: unknown, offsetMs: number): RecordingClip[] {
+  const clips: RecordingClip[] = [];
+  for (const item of unwrapTapoListEntries(rawList)) {
+    const start = Number(item.start_time ?? item.startTime);
+    const end = Number(item.end_time ?? item.endTime);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+    const decoded = decodeDetectionEventKinds(item);
+    clips.push({
+      start,
+      end,
+      duration: end - start,
+      type: decoded.alarmType ?? 2,
+      startLocal: formatWithOffset(start, offsetMs),
+      endLocal: formatWithOffset(end, offsetMs),
+      source: "event",
+      eventKinds: decoded.kinds,
+      ...(decoded.alarmType !== undefined ? { alarmType: decoded.alarmType } : {}),
+      ...(decoded.bitmask !== undefined ? { eventsBitmask: decoded.bitmask } : {}),
+    });
+  }
+  return clips;
+}
+
+export function parseVideoSegments(rawList: unknown, offsetMs: number): RecordingClip[] {
+  const clips: RecordingClip[] = [];
+  for (const item of unwrapTapoListEntries(rawList)) {
+    const start = Number(item.startTime ?? item.start_time);
+    const end = Number(item.endTime ?? item.end_time);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+    const type = Number(item.vedio_type ?? item.video_type ?? 0);
+    const eventKinds: DetectionEventKind[] =
+      type === 1 ? ["continuous"] : type === 2 ? ["event"] : ["unknown"];
+    clips.push({
+      start,
+      end,
+      duration: end - start,
+      type,
+      startLocal: formatWithOffset(start, offsetMs),
+      endLocal: formatWithOffset(end, offsetMs),
+      source: "segment",
+      eventKinds,
+    });
+  }
+  return clips;
+}
+
+export function parseRecordPlanDay(raw: unknown): RecordPlanSegment[] {
+  let list: unknown[] = [];
+  if (Array.isArray(raw)) {
+    list = raw;
+  } else if (typeof raw === "string" && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) list = parsed;
+    } catch {
+      return [];
+    }
+  }
+  const segments: RecordPlanSegment[] = [];
+  for (const entry of list) {
+    if (typeof entry !== "string") continue;
+    const m = entry.trim().match(/^(\d{4})-(\d{4}):([12])$/);
+    if (!m) continue;
+    const start = m[1]!;
+    const end = m[2]!;
+    const mode = Number(m[3]) === 1 ? 1 : 2;
+    if (end > start) {
+      segments.push({ start, end, mode });
+    }
+  }
+  segments.sort((a, b) => a.start.localeCompare(b.start));
+  return segments;
+}
+
+export function serializeRecordPlanDay(segments: RecordPlanSegment[]): string {
+  const normalized = segments
+    .filter(
+      (s) =>
+        /^\d{4}$/.test(s.start) &&
+        /^\d{4}$/.test(s.end) &&
+        s.end > s.start &&
+        (s.mode === 1 || s.mode === 2),
+    )
+    .sort((a, b) => a.start.localeCompare(b.start))
+    .map((s) => `${s.start}-${s.end}:${s.mode}`);
+  return JSON.stringify(normalized);
+}
+
+function emptyRecordPlanDays(): Record<RecordPlanDayKey, RecordPlanSegment[]> {
+  return {
+    monday: [],
+    tuesday: [],
+    wednesday: [],
+    thursday: [],
+    friday: [],
+    saturday: [],
+    sunday: [],
+  };
+}
+
+export function extractSdCardDetails(
+  sdEntry: Record<string, unknown> | undefined,
+  circularEntry?: Record<string, unknown>,
+): {
+  sdStatus: "ready" | "missing_or_unformatted" | "unknown";
+  sdErrorCode?: number;
+  sdCard?: SdCardDetails;
+} {
+  const sdErr = sdEntry ? getErrorCode(sdEntry) : -1;
+  const rawManage = (sdEntry?.result as Record<string, unknown> | undefined)?.harddisk_manage as
+    | Record<string, unknown>
+    | undefined;
+  const hdArr = Array.isArray(rawManage?.hd_info) ? rawManage.hd_info : [];
+  let infoObj: Record<string, unknown> | undefined;
+  if (hdArr.length > 0 && hdArr[0] && typeof hdArr[0] === "object") {
+    const first = hdArr[0] as Record<string, unknown>;
+    if ("status" in first || "total_space" in first || "detect_status" in first) {
+      infoObj = first;
+    } else {
+      const inner = Object.values(first).find((v) => v && typeof v === "object");
+      if (inner) infoObj = inner as Record<string, unknown>;
+    }
+  }
+
+  let sdStatus: "ready" | "missing_or_unformatted" | "unknown" =
+    sdErr === 0 ? "ready" : "unknown";
+
+  const statusText = typeof infoObj?.status === "string" ? infoObj.status : "";
+  const detectStatusText =
+    typeof infoObj?.detect_status === "string" ? infoObj.detect_status : "";
+  const statusLower = statusText.toLowerCase();
+  const detectLower = detectStatusText.toLowerCase();
+
+  if (sdErr === 0) {
+    if (hdArr.length === 0) {
+      sdStatus = "missing_or_unformatted";
+    } else if (
+      ["unformatted", "no_disk", "not_formatted"].includes(statusLower) ||
+      detectLower === "no_disk" ||
+      ((statusLower === "offline" || detectLower === "offline") && !infoObj?.total_space)
+    ) {
+      sdStatus = "missing_or_unformatted";
+    }
+  }
+
+  const circularManage = (circularEntry?.result as Record<string, unknown> | undefined)
+    ?.harddisk_manage as Record<string, unknown> | undefined;
+  const circularHarddisk = circularManage?.harddisk as Record<string, unknown> | undefined;
+  const loopFromCircular =
+    circularEntry && getErrorCode(circularEntry) === 0 && typeof circularHarddisk?.loop === "string"
+      ? circularHarddisk.loop === "on"
+      : undefined;
+  const loopFromHd =
+    infoObj?.loop_record_status !== undefined
+      ? String(infoObj.loop_record_status) === "1"
+      : undefined;
+  const loopRecordEnabled = loopFromCircular ?? loopFromHd;
+
+  const sdCard: SdCardDetails | undefined = infoObj
+    ? {
+        status: statusText || sdStatus,
+        ...(typeof infoObj.total_space === "string" ? { totalSpace: infoObj.total_space } : {}),
+        ...(typeof infoObj.free_space === "string" ? { freeSpace: infoObj.free_space } : {}),
+        ...(infoObj.percent !== undefined && Number.isFinite(Number(infoObj.percent))
+          ? { percent: Number(infoObj.percent) }
+          : {}),
+        ...(typeof infoObj.rw_attr === "string" ? { rwAttr: infoObj.rw_attr } : {}),
+        ...(loopRecordEnabled !== undefined ? { loopRecordEnabled } : {}),
+      }
+    : undefined;
+
+  return {
+    sdStatus,
+    ...(sdErr !== 0 ? { sdErrorCode: sdErr } : {}),
+    ...(sdCard ? { sdCard } : {}),
+  };
+}
+
+function normalizeSensitivityLabel(raw: unknown, numeric?: unknown): DetectionSensitivity {
+  const s = typeof raw === "string" ? raw.toLowerCase() : "";
+  if (s === "low") return "low";
+  if (s === "high") return "high";
+  if (s === "normal" || s === "medium") return "normal";
+  const n = Number(numeric ?? raw);
+  if (Number.isFinite(n)) {
+    if (n <= 33) return "low";
+    if (n >= 67) return "high";
+  }
+  return "normal";
+}
+
+function sensitivityToNumber(level: DetectionSensitivity): string {
+  if (level === "low") return "20";
+  if (level === "high") return "80";
+  return "50";
+}
+
+function sensitivityToApiLabel(level: DetectionSensitivity): string {
+  if (level === "low") return "low";
+  if (level === "high") return "high";
+  return "medium";
+}
+
+function parsePresetsFromResult(res: Record<string, unknown> | undefined): CameraPreset[] {
+  const presetObj = ((res?.result as Record<string, unknown> | undefined)?.preset as
+    | Record<string, unknown>
+    | undefined)?.preset as Record<string, unknown> | undefined;
+  const ids = Array.isArray(presetObj?.id) ? presetObj.id : [];
+  const names = Array.isArray(presetObj?.name) ? presetObj.name : [];
+  const out: CameraPreset[] = [];
+  for (let i = 0; i < ids.length; i++) {
+    const id = String(ids[i] ?? "").trim();
+    if (!id) continue;
+    out.push({ id, name: String(names[i] ?? id) });
+  }
+  return out;
+}
+
 export class TapoCloudClient {
   readonly combinedCa: string[];
   private cipcUrl = "";
   private iotAppServer = "";
   private servicesSyncVersion: "v2" | "v1" = "v2";
+  private playbackIndexCache = new Map<
+    string,
+    { clientId: number; startSec: number; endSec: number; updatedAt: number }
+  >();
 
   constructor(
     caPemPath: string,
@@ -113,6 +469,11 @@ export class TapoCloudClient {
     this.cipcUrl = "";
     this.iotAppServer = "";
     this.servicesSyncVersion = "v2";
+    this.playbackIndexCache.clear();
+  }
+
+  invalidatePlaybackSession(deviceId: string): void {
+    this.playbackIndexCache.delete(deviceId);
   }
 
   private deviceErrorMessage(code: number, fallbackKey: ServerMessageKey): string {
@@ -534,21 +895,16 @@ export class TapoCloudClient {
     return this.iotAppServer;
   }
 
-  async servicesSync(
+  async servicesSyncRaw(
     baseUrl: string,
     token: string,
     terminalUuid: string,
     deviceId: string,
-    requests: Array<Record<string, unknown>>,
-  ): Promise<Array<Record<string, unknown>>> {
+    requestData: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     const iotBase = await this.ensureIotServer(baseUrl, token);
     const body = JSON.stringify({
-      inputParams: {
-        requestData: {
-          method: "multipleRequest",
-          params: { requests },
-        },
-      },
+      inputParams: { requestData },
       serviceId: "passthrough",
     });
 
@@ -589,11 +945,60 @@ export class TapoCloudClient {
         dataCode,
       );
     }
+    return responseData;
+  }
+
+  async servicesSync(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+    requests: Array<Record<string, unknown>>,
+  ): Promise<Array<Record<string, unknown>>> {
+    const responseData = await this.servicesSyncRaw(baseUrl, token, terminalUuid, deviceId, {
+      method: "multipleRequest",
+      params: { requests },
+    });
     const responses = ((responseData.result ?? {}) as Record<string, unknown>).responses;
     if (!Array.isArray(responses)) {
       throw new TapoCloudError(tServer(this.getLang(), "camera_no_response"));
     }
     return responses as Array<Record<string, unknown>>;
+  }
+
+  private isRecoverableMethodOrFormatError(err: unknown): boolean {
+    if (!(err instanceof TapoCloudError) || err.isAuthError) return false;
+    if (
+      err.code === -40106 ||
+      err.code === -40209 ||
+      err.code === -40210 ||
+      err.code === 400
+    ) {
+      return true;
+    }
+    return err.message.includes("PASSTHROUGH_PAYLOAD_FORMAT_CHECK_FAIL");
+  }
+
+  private async execDeviceCommand(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+    method: string,
+    params: Record<string, unknown>,
+    fallbackKey: ServerMessageKey,
+  ): Promise<Record<string, unknown>> {
+    const res = await this.servicesSync(baseUrl, token, terminalUuid, deviceId, [
+      { method, params },
+    ]);
+    if (res.length === 0 || !res[0]) {
+      throw new TapoCloudError(tServer(this.getLang(), "camera_no_response"));
+    }
+    const code = getErrorCode(res[0]);
+    if (code !== 0) {
+      throw new TapoCloudError(this.deviceErrorMessage(code, fallbackKey), code);
+    }
+    return (res[0]?.result ?? {}) as Record<string, unknown>;
   }
 
   async getCapabilitySnapshot(
@@ -607,9 +1012,12 @@ export class TapoCloudClient {
         { method: "getVideoCapability", params: { video_capability: { name: ["main", "minor"] } } },
         { method: "getAppComponentList", params: { app_component: { name: ["app_component_list"] } } },
         { method: "getLensMaskConfig", params: { lens_mask: { name: ["lens_mask_info"] } } },
-        { method: "getSdCardFormatStatus", params: { harddisk_manage: { table: ["hd_info"] } } },
+        { method: "getSdCardStatus", params: { harddisk_manage: { table: ["hd_info"] } } },
         { method: "getClockStatus", params: { system: { name: ["clock_status"] } } },
         { method: "getAudioConfig", params: { audio_config: { name: ["speaker", "microphone"] } } },
+        { method: "getAlertConfig", params: { msg_alarm: { name: ["chn1_msg_alarm_info"] } } },
+        { method: "getLastAlarmInfo", params: { msg_alarm: { name: ["chn1_msg_alarm_info"] } } },
+        { method: "getPresetConfig", params: { preset: { name: ["preset"] } } },
       ]);
 
       const byMethod = new Map<string, Record<string, unknown>>();
@@ -632,8 +1040,7 @@ export class TapoCloudClient {
           | Record<string, unknown>
           | undefined
       )?.enabled;
-      const sdEntry = byMethod.get("getSdCardFormatStatus");
-      const sdErr = sdEntry ? getErrorCode(sdEntry) : -1;
+      const sdDetails = extractSdCardDetails(byMethod.get("getSdCardStatus"));
       const clockRes = byMethod.get("getClockStatus")?.result as Record<string, unknown> | undefined;
       const localTime = (
         (clockRes?.system as Record<string, unknown> | undefined)?.clock_status as Record<string, unknown> | undefined
@@ -643,20 +1050,37 @@ export class TapoCloudClient {
         | undefined;
       const micCfg = (audioCfg?.microphone ?? {}) as Record<string, unknown>;
       const spkCfg = (audioCfg?.speaker ?? {}) as Record<string, unknown>;
+      const alertEntry = byMethod.get("getAlertConfig");
+      const lastAlarmEntry = byMethod.get("getLastAlarmInfo");
+      const activeAlarmEntry =
+        alertEntry && getErrorCode(alertEntry) === 0
+          ? alertEntry
+          : lastAlarmEntry && getErrorCode(lastAlarmEntry) === 0
+            ? lastAlarmEntry
+            : undefined;
+      const alarmInfo = (
+        (activeAlarmEntry?.result as Record<string, unknown> | undefined)?.msg_alarm as
+          | Record<string, unknown>
+          | undefined
+      )?.chn1_msg_alarm_info as Record<string, unknown> | undefined;
+      const presets = parsePresetsFromResult(byMethod.get("getPresetConfig"));
 
       return {
         deviceId,
         online: true,
         privacyOn: maskEnabled === "on" ? true : maskEnabled === "off" ? false : null,
         ptzSupported: Array.isArray(compList) && compList.some((c) => c.name === "ptz"),
-        sdStatus: sdErr === 0 ? "ready" : sdErr === -40209 ? "missing_or_unformatted" : "unknown",
-        sdErrorCode: sdErr !== 0 ? sdErr : undefined,
+        sdStatus: sdDetails.sdStatus,
+        ...(sdDetails.sdErrorCode !== undefined ? { sdErrorCode: sdDetails.sdErrorCode } : {}),
+        ...(sdDetails.sdCard ? { sdCard: sdDetails.sdCard } : {}),
         cameraTime: typeof localTime === "string" ? localTime : undefined,
         resolutions: Array.isArray(mainCap.resolutions) ? mainCap.resolutions.map(String) : undefined,
         encodeTypes: Array.isArray(mainCap.encode_types) ? mainCap.encode_types.map(String) : undefined,
         micVolume: micCfg.volume !== undefined ? Number(micCfg.volume) : undefined,
         micMuted: micCfg.mute === "on",
         speakerVolume: spkCfg.volume !== undefined ? Number(spkCfg.volume) : undefined,
+        ...(alarmInfo ? { alarmEnabled: alarmInfo.enabled === "on" } : {}),
+        ...(presets.length > 0 ? { presets } : {}),
         lastCheckedAt: Date.now(),
       };
     } catch (err) {
@@ -673,6 +1097,747 @@ export class TapoCloudClient {
     }
   }
 
+  private async fetchRawAlarmInfo(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+  ): Promise<Record<string, unknown>> {
+    const res = await this.servicesSync(baseUrl, token, terminalUuid, deviceId, [
+      { method: "getAlertConfig", params: { msg_alarm: { name: ["chn1_msg_alarm_info"] } } },
+      { method: "getLastAlarmInfo", params: { msg_alarm: { name: ["chn1_msg_alarm_info"] } } },
+      { method: "getAlarmConfig", params: { msg_alarm: {} } },
+    ]);
+    for (const entry of res) {
+      if (getErrorCode(entry) !== 0) continue;
+      const msgAlarm = (entry.result as Record<string, unknown> | undefined)?.msg_alarm as
+        | Record<string, unknown>
+        | undefined;
+      const info = (msgAlarm?.chn1_msg_alarm_info ?? msgAlarm) as Record<string, unknown> | undefined;
+      if (info && typeof info === "object") {
+        return { ...info };
+      }
+    }
+    return {};
+  }
+
+  async getCameraSettings(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+  ): Promise<CameraSettingsSnapshot> {
+    const [batchA, batchB] = await Promise.all([
+      this.servicesSync(baseUrl, token, terminalUuid, deviceId, [
+        { method: "getAudioConfig", params: { audio_config: { name: ["speaker", "microphone"] } } },
+        { method: "getSdCardStatus", params: { harddisk_manage: { table: ["hd_info"] } } },
+        { method: "getCircularRecordingConfig", params: { harddisk_manage: { name: "harddisk" } } },
+        { method: "getAlertConfig", params: { msg_alarm: { name: ["chn1_msg_alarm_info"] } } },
+        { method: "getLastAlarmInfo", params: { msg_alarm: { name: ["chn1_msg_alarm_info"] } } },
+        { method: "getAlarmConfig", params: { msg_alarm: {} } },
+        { method: "getSirenTypeList", params: { msg_alarm: {} } },
+        { method: "getSirenStatus", params: { msg_alarm: {} } },
+        { method: "getReboot", params: { timing_reboot: { name: ["reboot"] } } },
+        { method: "getRecordPlan", params: { record_plan: { name: ["chn1_channel"] } } },
+      ]),
+      this.servicesSync(baseUrl, token, terminalUuid, deviceId, [
+        { method: "getLightFrequencyInfo", params: { image: { name: "common" } } },
+        { method: "getRotationStatus", params: { image: { name: ["switch"] } } },
+        { method: "getLedStatus", params: { led: { name: ["config"] } } },
+        { method: "getTargetTrackConfig", params: { target_track: { name: ["target_track_info"] } } },
+        { method: "getDetectionConfig", params: { motion_detection: { name: ["motion_det"] } } },
+        { method: "getPersonDetectionConfig", params: { people_detection: { name: ["detection"] } } },
+        { method: "getPresetConfig", params: { preset: { name: ["preset"] } } },
+      ]),
+    ]);
+
+    const byMethod = new Map<string, Record<string, unknown>>();
+    for (const r of [...batchA, ...batchB]) {
+      if (typeof r.method === "string") byMethod.set(r.method, r);
+    }
+
+    const audioCfg = (byMethod.get("getAudioConfig")?.result as Record<string, unknown> | undefined)?.audio_config as
+      | Record<string, unknown>
+      | undefined;
+    const micCfg = (audioCfg?.microphone ?? {}) as Record<string, unknown>;
+    const spkCfg = (audioCfg?.speaker ?? {}) as Record<string, unknown>;
+
+    const sdDetails = extractSdCardDetails(
+      byMethod.get("getSdCardStatus"),
+      byMethod.get("getCircularRecordingConfig"),
+    );
+
+    const alertEntry = byMethod.get("getAlertConfig");
+    const lastAlarmEntry = byMethod.get("getLastAlarmInfo");
+    const alarmEntry = byMethod.get("getAlarmConfig");
+    const activeAlarmEntry =
+      alertEntry && getErrorCode(alertEntry) === 0
+        ? alertEntry
+        : lastAlarmEntry && getErrorCode(lastAlarmEntry) === 0
+          ? lastAlarmEntry
+          : alarmEntry && getErrorCode(alarmEntry) === 0
+            ? alarmEntry
+            : undefined;
+    const alarmMsgObj = (activeAlarmEntry?.result as Record<string, unknown> | undefined)?.msg_alarm as
+      | Record<string, unknown>
+      | undefined;
+    const alarmInfo = (alarmMsgObj?.chn1_msg_alarm_info ?? alarmMsgObj) as
+      | Record<string, unknown>
+      | undefined;
+    const sirenListEntry = byMethod.get("getSirenTypeList");
+    const rawSirenList =
+      sirenListEntry && getErrorCode(sirenListEntry) === 0
+        ? (sirenListEntry.result as Record<string, unknown> | undefined)?.siren_type_list
+        : undefined;
+    const sirenStatusEntry = byMethod.get("getSirenStatus");
+    const rawSirenStatus =
+      sirenStatusEntry && getErrorCode(sirenStatusEntry) === 0
+        ? (sirenStatusEntry.result as Record<string, unknown> | undefined)?.status
+        : undefined;
+
+    const alarmVolRaw = String(alarmInfo?.alarm_volume ?? "normal").toLowerCase();
+    const alarmVolume: AlarmVolume =
+      alarmVolRaw === "low" || alarmVolRaw === "high" ? alarmVolRaw : "normal";
+    const alarm: CameraAlarmConfig = {
+      supported: Boolean(activeAlarmEntry),
+      enabled: alarmInfo?.enabled === "on",
+      alarmMode: Array.isArray(alarmInfo?.alarm_mode)
+        ? alarmInfo.alarm_mode.map(String)
+        : ["sound"],
+      alarmType: String(alarmInfo?.alarm_type ?? "0"),
+      alarmVolume,
+      alarmDuration: Number.isFinite(Number(alarmInfo?.alarm_duration))
+        ? Number(alarmInfo?.alarm_duration)
+        : 0,
+      sirenTypes: Array.isArray(rawSirenList) ? rawSirenList.map(String) : [],
+      ...(rawSirenStatus === "on" || rawSirenStatus === "off"
+        ? { sirenStatus: rawSirenStatus }
+        : {}),
+    };
+
+    const rebootEntry = byMethod.get("getReboot");
+    const rebootRaw = (
+      (rebootEntry?.result as Record<string, unknown> | undefined)?.timing_reboot as
+        | Record<string, unknown>
+        | undefined
+    )?.reboot as Record<string, unknown> | undefined;
+    const validDays = new Set<RebootScheduleDay>([
+      "everyday",
+      "monday",
+      "tuesday",
+      "wednesday",
+      "thursday",
+      "friday",
+      "saturday",
+      "sunday",
+    ]);
+    const rawDay = String(rebootRaw?.day ?? "everyday").toLowerCase() as RebootScheduleDay;
+    const rebootSchedule: CameraRebootSchedule = {
+      supported: Boolean(rebootEntry && getErrorCode(rebootEntry) === 0 && rebootRaw),
+      enabled: rebootRaw?.enabled === "on",
+      time: typeof rebootRaw?.time === "string" && /^\d{2}:\d{2}$/.test(rebootRaw.time)
+        ? rebootRaw.time
+        : "03:00",
+      day: validDays.has(rawDay) ? rawDay : "everyday",
+      ...(rebootRaw?.random_range !== undefined && Number.isFinite(Number(rebootRaw.random_range))
+        ? { randomRange: Number(rebootRaw.random_range) }
+        : {}),
+    };
+
+    const planEntry = byMethod.get("getRecordPlan");
+    const planRaw = (
+      (planEntry?.result as Record<string, unknown> | undefined)?.record_plan as
+        | Record<string, unknown>
+        | undefined
+    )?.chn1_channel as Record<string, unknown> | undefined;
+    const planDays = emptyRecordPlanDays();
+    if (planRaw) {
+      for (const dayKey of RECORD_PLAN_DAYS) {
+        planDays[dayKey] = parseRecordPlanDay(planRaw[dayKey]);
+      }
+    }
+    const recordPlan: CameraRecordPlan = {
+      supported: Boolean(planEntry && getErrorCode(planEntry) === 0 && planRaw),
+      enabled: planRaw?.enabled === "on",
+      days: planDays,
+    };
+
+    const lightEntry = byMethod.get("getLightFrequencyInfo");
+    const infType = (
+      (lightEntry?.result as Record<string, unknown> | undefined)?.image as
+        | Record<string, unknown>
+        | undefined
+    )?.common as Record<string, unknown> | undefined;
+    const rawInf = typeof infType?.inf_type === "string" ? infType.inf_type : undefined;
+    const dayNightMode: DayNightMode | undefined =
+      rawInf === "auto" || rawInf === "on" || rawInf === "off" ? rawInf : undefined;
+
+    const rotEntry = byMethod.get("getRotationStatus");
+    const rotSwitch = (
+      (rotEntry?.result as Record<string, unknown> | undefined)?.image as
+        | Record<string, unknown>
+        | undefined
+    )?.switch as Record<string, unknown> | undefined;
+    const imageFlip =
+      rotEntry && getErrorCode(rotEntry) === 0 && rotSwitch
+        ? rotSwitch.flip_type === "center"
+        : undefined;
+
+    const ledEntry = byMethod.get("getLedStatus");
+    const ledCfg = (
+      (ledEntry?.result as Record<string, unknown> | undefined)?.led as
+        | Record<string, unknown>
+        | undefined
+    )?.config as Record<string, unknown> | undefined;
+    const ledEnabled =
+      ledEntry && getErrorCode(ledEntry) === 0 && ledCfg ? ledCfg.enabled === "on" : undefined;
+
+    const trackEntry = byMethod.get("getTargetTrackConfig");
+    const trackInfo = (
+      (trackEntry?.result as Record<string, unknown> | undefined)?.target_track as
+        | Record<string, unknown>
+        | undefined
+    )?.target_track_info as Record<string, unknown> | undefined;
+    const autoTracking =
+      trackEntry && getErrorCode(trackEntry) === 0 && trackInfo
+        ? trackInfo.enabled === "on"
+        : undefined;
+
+    const motionEntry = byMethod.get("getDetectionConfig");
+    const motionDet = (
+      (motionEntry?.result as Record<string, unknown> | undefined)?.motion_detection as
+        | Record<string, unknown>
+        | undefined
+    )?.motion_det as Record<string, unknown> | undefined;
+    const motionDetection =
+      motionEntry && getErrorCode(motionEntry) === 0 && motionDet
+        ? {
+            supported: true,
+            enabled: motionDet.enabled === "on",
+            sensitivity: normalizeSensitivityLabel(
+              motionDet.sensitivity,
+              motionDet.digital_sensitivity,
+            ),
+          }
+        : { supported: false, enabled: false, sensitivity: "normal" as DetectionSensitivity };
+
+    const personEntry = byMethod.get("getPersonDetectionConfig");
+    const personDet = (
+      (personEntry?.result as Record<string, unknown> | undefined)?.people_detection as
+        | Record<string, unknown>
+        | undefined
+    )?.detection as Record<string, unknown> | undefined;
+    const personDetection =
+      personEntry && getErrorCode(personEntry) === 0 && personDet
+        ? {
+            supported: true,
+            enabled: personDet.enabled === "on",
+            sensitivity: normalizeSensitivityLabel(personDet.sensitivity),
+          }
+        : { supported: false, enabled: false, sensitivity: "normal" as DetectionSensitivity };
+
+    const presets = parsePresetsFromResult(byMethod.get("getPresetConfig"));
+
+    return {
+      deviceId,
+      online: true,
+      speakerVolume: spkCfg.volume !== undefined ? Number(spkCfg.volume) : undefined,
+      micVolume: micCfg.volume !== undefined ? Number(micCfg.volume) : undefined,
+      micMuted: micCfg.mute === "on",
+      ...(sdDetails.sdCard ? { sdCard: sdDetails.sdCard } : {}),
+      alarm,
+      rebootSchedule,
+      recordPlan,
+      ...(dayNightMode ? { dayNightMode } : {}),
+      ...(imageFlip !== undefined ? { imageFlip } : {}),
+      ...(ledEnabled !== undefined ? { ledEnabled } : {}),
+      ...(autoTracking !== undefined ? { autoTracking } : {}),
+      motionDetection,
+      personDetection,
+      presets,
+      lastCheckedAt: Date.now(),
+    };
+  }
+
+  async updateCameraSettings(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+    patch: CameraSettingsPatch,
+  ): Promise<CameraSettingsSnapshot> {
+    if (patch.speakerVolume !== undefined && Number.isFinite(patch.speakerVolume)) {
+      await this.setSpeakerVolume(baseUrl, token, terminalUuid, deviceId, patch.speakerVolume);
+    }
+    if (patch.micVolume !== undefined || patch.micMuted !== undefined) {
+      await this.setMicrophoneConfig(baseUrl, token, terminalUuid, deviceId, {
+        volume: patch.micVolume,
+        mute: patch.micMuted,
+      });
+    }
+    if (patch.alarm) {
+      await this.setAlarmConfig(baseUrl, token, terminalUuid, deviceId, patch.alarm);
+    }
+    if (patch.rebootSchedule) {
+      await this.setRebootSchedule(baseUrl, token, terminalUuid, deviceId, patch.rebootSchedule);
+    }
+    if (patch.recordPlan) {
+      await this.setRecordPlan(baseUrl, token, terminalUuid, deviceId, patch.recordPlan);
+    }
+    if (patch.dayNightMode !== undefined) {
+      await this.execDeviceCommand(
+        baseUrl,
+        token,
+        terminalUuid,
+        deviceId,
+        "setDayNightModeConfig",
+        { image: { common: { inf_type: patch.dayNightMode } } },
+        "settings_error_code",
+      );
+    }
+    if (patch.imageFlip !== undefined) {
+      await this.execDeviceCommand(
+        baseUrl,
+        token,
+        terminalUuid,
+        deviceId,
+        "setRotationStatus",
+        { image: { switch: { flip_type: patch.imageFlip ? "center" : "off" } } },
+        "settings_error_code",
+      );
+    }
+    if (patch.ledEnabled !== undefined) {
+      await this.execDeviceCommand(
+        baseUrl,
+        token,
+        terminalUuid,
+        deviceId,
+        "setLedStatus",
+        { led: { config: { enabled: patch.ledEnabled ? "on" : "off" } } },
+        "settings_error_code",
+      );
+    }
+    if (patch.autoTracking !== undefined) {
+      await this.execDeviceCommand(
+        baseUrl,
+        token,
+        terminalUuid,
+        deviceId,
+        "setTargetTrackConfig",
+        { target_track: { target_track_info: { enabled: patch.autoTracking ? "on" : "off" } } },
+        "settings_error_code",
+      );
+    }
+    if (patch.motionDetection) {
+      const motionDet: Record<string, string> = {};
+      if (patch.motionDetection.enabled !== undefined) {
+        motionDet.enabled = patch.motionDetection.enabled ? "on" : "off";
+      }
+      if (patch.motionDetection.sensitivity !== undefined) {
+        motionDet.digital_sensitivity = sensitivityToNumber(patch.motionDetection.sensitivity);
+        motionDet.sensitivity = sensitivityToApiLabel(patch.motionDetection.sensitivity);
+      }
+      await this.execDeviceCommand(
+        baseUrl,
+        token,
+        terminalUuid,
+        deviceId,
+        "setDetectionConfig",
+        { motion_detection: { motion_det: motionDet } },
+        "settings_error_code",
+      );
+    }
+    if (patch.personDetection) {
+      const personDet: Record<string, string> = {};
+      if (patch.personDetection.enabled !== undefined) {
+        personDet.enabled = patch.personDetection.enabled ? "on" : "off";
+      }
+      if (patch.personDetection.sensitivity !== undefined) {
+        personDet.sensitivity = sensitivityToNumber(patch.personDetection.sensitivity);
+      }
+      await this.execDeviceCommand(
+        baseUrl,
+        token,
+        terminalUuid,
+        deviceId,
+        "setPersonDetectionConfig",
+        { people_detection: { detection: personDet } },
+        "settings_error_code",
+      );
+    }
+
+    return await this.getCameraSettings(baseUrl, token, terminalUuid, deviceId);
+  }
+
+  async setSpeakerVolume(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+    volume: number,
+  ): Promise<void> {
+    const clamped = Math.max(0, Math.min(100, Math.round(volume)));
+    await this.execDeviceCommand(
+      baseUrl,
+      token,
+      terminalUuid,
+      deviceId,
+      "setSpeakerVolume",
+      { method: "set", audio_config: { speaker: { volume: String(clamped) } } },
+      "speaker_error_code",
+    );
+  }
+
+  async setAlarmConfig(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+    opts: {
+      enabled?: boolean;
+      alarmMode?: string[];
+      alarmType?: string;
+      alarmVolume?: AlarmVolume;
+      alarmDuration?: number;
+    },
+  ): Promise<void> {
+    const current = await this.fetchRawAlarmInfo(baseUrl, token, terminalUuid, deviceId);
+    const cleaned: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(current)) {
+      if (!k.startsWith(".")) cleaned[k] = v;
+    }
+
+    const merged: Record<string, unknown> = {
+      alarm_type: "0",
+      light_type: "0",
+      alarm_mode: ["sound"],
+      ...cleaned,
+    };
+    if (opts.enabled !== undefined) merged.enabled = opts.enabled ? "on" : "off";
+    if (opts.alarmMode && opts.alarmMode.length > 0) merged.alarm_mode = opts.alarmMode;
+    if (opts.alarmType !== undefined) merged.alarm_type = String(opts.alarmType);
+    if (opts.alarmVolume !== undefined) merged.alarm_volume = opts.alarmVolume;
+    if (opts.alarmDuration !== undefined && Number.isFinite(opts.alarmDuration)) {
+      merged.alarm_duration = String(Math.max(0, Math.min(300, Math.round(opts.alarmDuration))));
+    }
+
+    if ("sound_alarm_enabled" in cleaned) {
+      merged.sound_alarm_enabled =
+        merged.enabled === "on" &&
+        Array.isArray(merged.alarm_mode) &&
+        merged.alarm_mode.includes("sound")
+          ? "on"
+          : "off";
+    }
+    if ("light_alarm_enabled" in cleaned) {
+      merged.light_alarm_enabled =
+        merged.enabled === "on" &&
+        Array.isArray(merged.alarm_mode) &&
+        merged.alarm_mode.includes("light")
+          ? "on"
+          : "off";
+    }
+
+    const attempts: Array<() => Promise<unknown>> = [
+      () =>
+        this.execDeviceCommand(
+          baseUrl,
+          token,
+          terminalUuid,
+          deviceId,
+          "setAlertConfig",
+          { msg_alarm: { chn1_msg_alarm_info: merged } },
+          "alarm_error_code",
+        ),
+      () =>
+        this.execDeviceCommand(
+          baseUrl,
+          token,
+          terminalUuid,
+          deviceId,
+          "setAlarmConfig",
+          { method: "set", msg_alarm: { chn1_msg_alarm_info: merged } },
+          "alarm_error_code",
+        ),
+      () =>
+        this.execDeviceCommand(
+          baseUrl,
+          token,
+          terminalUuid,
+          deviceId,
+          "setAlarmConfig",
+          { msg_alarm: merged },
+          "alarm_error_code",
+        ),
+    ];
+
+    let lastErr: unknown;
+    for (const run of attempts) {
+      try {
+        await run();
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (!this.isRecoverableMethodOrFormatError(err)) throw err;
+      }
+    }
+    throw lastErr;
+  }
+
+  async triggerManualAlarm(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+    action: "start" | "stop",
+  ): Promise<void> {
+    const startFlag = action === "start";
+    const candidates: Array<() => Promise<unknown>> = [
+      () =>
+        this.execDeviceCommand(
+          baseUrl,
+          token,
+          terminalUuid,
+          deviceId,
+          "do",
+          { msg_alarm: { manual_msg_alarm: { action } } },
+          "alarm_error_code",
+        ),
+      () =>
+        this.execDeviceCommand(
+          baseUrl,
+          token,
+          terminalUuid,
+          deviceId,
+          "do",
+          { msg_alarm: { manual_alarm: { action } } },
+          "alarm_error_code",
+        ),
+      () =>
+        this.execDeviceCommand(
+          baseUrl,
+          token,
+          terminalUuid,
+          deviceId,
+          startFlag ? "startManualAlarm" : "stopManualAlarm",
+          { msg_alarm: { manual_msg_alarm: { action } } },
+          "alarm_error_code",
+        ),
+      async () => {
+        if (startFlag) {
+          const info = await this.fetchRawAlarmInfo(baseUrl, token, terminalUuid, deviceId).catch(
+            () => ({} as Record<string, unknown>),
+          );
+          const alarmType = String(info.alarm_type ?? "0");
+          return this.execDeviceCommand(
+            baseUrl,
+            token,
+            terminalUuid,
+            deviceId,
+            "testUsrDefAudio",
+            { msg_alarm: { test_usr_def_audio: { force: "1", id: alarmType } } },
+            "alarm_error_code",
+          );
+        }
+        return this.execDeviceCommand(
+          baseUrl,
+          token,
+          terminalUuid,
+          deviceId,
+          "testUsrDefAudio",
+          { msg_alarm: { test_usr_def_audio: { action: "stop" } } },
+          "alarm_error_code",
+        );
+      },
+      () =>
+        this.execDeviceCommand(
+          baseUrl,
+          token,
+          terminalUuid,
+          deviceId,
+          "setSirenStatus",
+          { msg_alarm: { status: startFlag ? "on" : "off" } },
+          "alarm_error_code",
+        ),
+      () =>
+        this.execDeviceCommand(
+          baseUrl,
+          token,
+          terminalUuid,
+          deviceId,
+          "setSirenStatus",
+          { siren: { status: startFlag ? "on" : "off" } },
+          "alarm_error_code",
+        ),
+      () =>
+        this.servicesSyncRaw(baseUrl, token, terminalUuid, deviceId, {
+          method: "do",
+          params: { msg_alarm: { manual_msg_alarm: { action } } },
+        }),
+    ];
+
+    let lastErr: unknown;
+    for (const run of candidates) {
+      try {
+        await run();
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (!this.isRecoverableMethodOrFormatError(err)) throw err;
+      }
+    }
+    throw lastErr;
+  }
+
+  async rebootCamera(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+  ): Promise<void> {
+    await this.execDeviceCommand(
+      baseUrl,
+      token,
+      terminalUuid,
+      deviceId,
+      "rebootDevice",
+      { system: { reboot: "null" } },
+      "reboot_error_code",
+    );
+  }
+
+  async setRebootSchedule(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+    opts: { enabled: boolean; time: string; day: RebootScheduleDay },
+  ): Promise<void> {
+    const time = /^\d{2}:\d{2}$/.test(opts.time) ? opts.time : "03:00";
+    await this.execDeviceCommand(
+      baseUrl,
+      token,
+      terminalUuid,
+      deviceId,
+      "setReboot",
+      {
+        timing_reboot: {
+          reboot: {
+            enabled: opts.enabled ? "on" : "off",
+            time,
+            day: opts.day || "everyday",
+            random_range: 30,
+          },
+        },
+      },
+      "reboot_error_code",
+    );
+  }
+
+  async setRecordPlan(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+    plan: { enabled: boolean; days: Record<RecordPlanDayKey, RecordPlanSegment[]> },
+  ): Promise<void> {
+    const channelPayload: Record<string, string> = {
+      enabled: plan.enabled ? "on" : "off",
+    };
+    for (const day of RECORD_PLAN_DAYS) {
+      channelPayload[day] = serializeRecordPlanDay(plan.days[day] ?? []);
+    }
+    await this.execDeviceCommand(
+      baseUrl,
+      token,
+      terminalUuid,
+      deviceId,
+      "setRecordPlan",
+      { record_plan: { chn1_channel: channelPayload } },
+      "record_plan_error_code",
+    );
+  }
+
+  async goToPreset(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+    presetId: string,
+  ): Promise<void> {
+    await this.execDeviceCommand(
+      baseUrl,
+      token,
+      terminalUuid,
+      deviceId,
+      "motorMoveToPreset",
+      { preset: { goto_preset: { id: String(presetId) } } },
+      "preset_error_code",
+    );
+  }
+
+  async savePreset(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+    name: string,
+  ): Promise<CameraPreset[]> {
+    const clean = name.trim().slice(0, 32);
+    await this.execDeviceCommand(
+      baseUrl,
+      token,
+      terminalUuid,
+      deviceId,
+      "addMotorPostion",
+      { preset: { set_preset: { name: clean, save_ptz: "1" } } },
+      "preset_error_code",
+    );
+    const res = await this.servicesSync(baseUrl, token, terminalUuid, deviceId, [
+      { method: "getPresetConfig", params: { preset: { name: ["preset"] } } },
+    ]);
+    return parsePresetsFromResult(res[0]);
+  }
+
+  async deletePreset(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+    presetId: string,
+  ): Promise<CameraPreset[]> {
+    await this.execDeviceCommand(
+      baseUrl,
+      token,
+      terminalUuid,
+      deviceId,
+      "deletePreset",
+      { preset: { remove_preset: { id: [String(presetId)] } } },
+      "preset_error_code",
+    );
+    const res = await this.servicesSync(baseUrl, token, terminalUuid, deviceId, [
+      { method: "getPresetConfig", params: { preset: { name: ["preset"] } } },
+    ]);
+    return parsePresetsFromResult(res[0]);
+  }
+
+  async calibrateMotor(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+  ): Promise<void> {
+    await this.execDeviceCommand(
+      baseUrl,
+      token,
+      terminalUuid,
+      deviceId,
+      "manualCalibrate",
+      { motor: { manual_cali: "" } },
+      "ptz_rejected_code",
+    );
+  }
+
   async setMicrophoneConfig(
     baseUrl: string,
     token: string,
@@ -687,13 +1852,15 @@ export class TapoCloudClient {
     if (opts.mute !== undefined) {
       mic.mute = opts.mute ? "on" : "off";
     }
-    const res = await this.servicesSync(baseUrl, token, terminalUuid, deviceId, [
-      { method: "setMicrophoneVolume", params: { method: "set", audio_config: { microphone: mic } } },
-    ]);
-    const code = getErrorCode(res[0]);
-    if (code !== 0) {
-      throw new TapoCloudError(this.deviceErrorMessage(code, "mic_error_code"), code);
-    }
+    await this.execDeviceCommand(
+      baseUrl,
+      token,
+      terminalUuid,
+      deviceId,
+      "setMicrophoneVolume",
+      { method: "set", audio_config: { microphone: mic } },
+      "mic_error_code",
+    );
   }
 
   async setPrivacyMode(
@@ -703,16 +1870,15 @@ export class TapoCloudClient {
     deviceId: string,
     enabled: boolean,
   ): Promise<boolean> {
-    const res = await this.servicesSync(baseUrl, token, terminalUuid, deviceId, [
-      {
-        method: "setLensMaskConfig",
-        params: { lens_mask: { lens_mask_info: { enabled: enabled ? "on" : "off" } } },
-      },
-    ]);
-    const code = getErrorCode(res[0]);
-    if (code !== 0) {
-      throw new TapoCloudError(this.deviceErrorMessage(code, "privacy_error_code"), code);
-    }
+    await this.execDeviceCommand(
+      baseUrl,
+      token,
+      terminalUuid,
+      deviceId,
+      "setLensMaskConfig",
+      { lens_mask: { lens_mask_info: { enabled: enabled ? "on" : "off" } } },
+      "privacy_error_code",
+    );
     return enabled;
   }
 
@@ -726,16 +1892,15 @@ export class TapoCloudClient {
   ): Promise<void> {
     const clampedX = Math.max(-200, Math.min(200, Math.round(x)));
     const clampedY = Math.max(-200, Math.min(200, Math.round(y)));
-    const res = await this.servicesSync(baseUrl, token, terminalUuid, deviceId, [
-      {
-        method: "motorMove",
-        params: { motor: { move: { x_coord: String(clampedX), y_coord: String(clampedY) } } },
-      },
-    ]);
-    const code = getErrorCode(res[0]);
-    if (code !== 0) {
-      throw new TapoCloudError(this.deviceErrorMessage(code, "ptz_rejected_code"), code);
-    }
+    await this.execDeviceCommand(
+      baseUrl,
+      token,
+      terminalUuid,
+      deviceId,
+      "motorMove",
+      { motor: { move: { x_coord: String(clampedX), y_coord: String(clampedY) } } },
+      "ptz_rejected_code",
+    );
   }
 
   async searchRecordingDays(
@@ -757,6 +1922,7 @@ export class TapoCloudClient {
       },
     ]);
     const code = getErrorCode(res[0]);
+    if (code === -71112) return [];
     if (code !== 0) {
       throw new TapoCloudError(this.deviceErrorMessage(code, "sd_error_code"), code);
     }
@@ -787,65 +1953,276 @@ export class TapoCloudClient {
     dateYmd: string,
   ): Promise<RecordingDayResponse> {
     const cleanDate = dateYmd.replaceAll("-", "");
-    const res = await this.servicesSync(baseUrl, token, terminalUuid, deviceId, [
+    const tzRes = await this.servicesSync(baseUrl, token, terminalUuid, deviceId, [
       {
         method: "getTimezone",
         params: { system: { name: ["basic"] } },
       },
-      {
-        method: "searchVideoOfDay",
-        params: {
-          playback: {
-            search_video_utility: {
-              channel: [0],
-              date: cleanDate,
-              start_index: 0,
-              end_index: 999,
-            },
-          },
-        },
-      },
     ]);
-    const tzRes = res[0];
-    const searchRes = res[1];
-    const searchCode = getErrorCode(searchRes);
-    if (searchCode !== 0) {
-      throw new TapoCloudError(
-        this.deviceErrorMessage(searchCode, "recordings_read_error"),
-        searchCode,
-      );
-    }
-
-    const basic = (((tzRes?.result as Record<string, unknown>)?.system as Record<string, unknown>)?.basic ??
+    const basic = (((tzRes[0]?.result as Record<string, unknown>)?.system as Record<string, unknown>)?.basic ??
       {}) as Record<string, unknown>;
     const timezone = String(basic.timezone ?? "UTC+00:00");
     const offsetMs = parseTzOffsetMs(timezone);
+    const { startSec, endSec } = dayRangeUtcSec(dateYmd, offsetMs);
 
-    const playback = ((searchRes?.result ?? {}) as Record<string, unknown>).playback as
-      | Record<string, unknown>
-      | undefined;
-    const rawItems = Array.isArray(playback?.search_video_results) ? playback.search_video_results : [];
-    const clips: RecordingClip[] = [];
-    for (const entry of rawItems) {
-      if (!entry || typeof entry !== "object") continue;
-      for (const val of Object.values(entry as Record<string, unknown>)) {
-        if (!val || typeof val !== "object") continue;
-        const item = val as Record<string, unknown>;
-        const start = Number(item.startTime);
-        const end = Number(item.endTime);
-        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
-        clips.push({
-          start,
-          end,
-          duration: end - start,
-          type: Number(item.vedio_type ?? item.video_type ?? 0),
-          startLocal: formatWithOffset(start, offsetMs),
-          endLocal: formatWithOffset(end, offsetMs),
+    const PAGE_SIZE = 200;
+    const events: RecordingClip[] = [];
+    const segments: RecordingClip[] = [];
+    let hardErrorCode: number | null = null;
+    let useUtcFallback = false;
+    let detDone = false;
+    let segDone = false;
+    let detOffset = 0;
+    let segOffset = 0;
+
+    for (let page = 0; page < 15; page++) {
+      const batchRequests: Array<Record<string, unknown>> = [];
+      let detReqIdx = -1;
+      let segReqIdx = -1;
+
+      if (!detDone) {
+        detReqIdx = batchRequests.length;
+        batchRequests.push({
+          method: "searchDetectionList",
+          params: {
+            playback: {
+              search_detection_list: {
+                channel: 0,
+                start_index: detOffset,
+                end_index: detOffset + PAGE_SIZE - 1,
+                start_time: startSec,
+                end_time: endSec,
+              },
+            },
+          },
+        });
+      }
+      if (!segDone && !useUtcFallback && page < 5) {
+        segReqIdx = batchRequests.length;
+        batchRequests.push({
+          method: "searchVideoOfDay",
+          params: {
+            playback: {
+              search_video_utility: {
+                channel: [0],
+                date: cleanDate,
+                start_index: segOffset,
+                end_index: segOffset + PAGE_SIZE - 1,
+              },
+            },
+          },
+        });
+      }
+      if (batchRequests.length === 0) break;
+
+      const res = await this.servicesSync(baseUrl, token, terminalUuid, deviceId, batchRequests);
+      const detRes = detReqIdx >= 0 ? res[detReqIdx] : undefined;
+      const segRes = segReqIdx >= 0 ? res[segReqIdx] : undefined;
+
+      if (detRes) {
+        const detCode = getErrorCode(detRes);
+        if (detCode === 0) {
+          const detPlayback = ((detRes.result ?? {}) as Record<string, unknown>).playback as
+            | Record<string, unknown>
+            | undefined;
+          const parsedEvents = parseDetectionListEntries(detPlayback?.search_detection_list, offsetMs);
+          events.push(...parsedEvents);
+          detOffset += parsedEvents.length;
+          const hasMore = Number(detPlayback?.to_be_continued ?? 0) === 1;
+          if (parsedEvents.length === 0 || (!hasMore && parsedEvents.length < PAGE_SIZE)) {
+            detDone = true;
+          }
+        } else {
+          if (detCode !== -71112 && detCode !== -40210 && detCode !== -40106) {
+            hardErrorCode = hardErrorCode ?? detCode;
+          }
+          detDone = true;
+        }
+      }
+
+      if (segRes) {
+        const segCode = getErrorCode(segRes);
+        if (segCode === 0) {
+          const segPlayback = ((segRes.result ?? {}) as Record<string, unknown>).playback as
+            | Record<string, unknown>
+            | undefined;
+          const parsedSegs = parseVideoSegments(segPlayback?.search_video_results, offsetMs);
+          segments.push(...parsedSegs);
+          segOffset += parsedSegs.length;
+          const hasMore = Number(segPlayback?.to_be_continued ?? 0) === 1;
+          if (parsedSegs.length === 0 || (!hasMore && parsedSegs.length < PAGE_SIZE)) {
+            segDone = true;
+          }
+        } else if (segCode === -40210 || segCode === -71103 || segCode === -71112) {
+          useUtcFallback = true;
+          segDone = true;
+        } else {
+          hardErrorCode = hardErrorCode ?? segCode;
+          segDone = true;
+        }
+      } else if (page >= 5 || useUtcFallback) {
+        segDone = true;
+      }
+
+      if (detDone && segDone) {
+        break;
+      }
+    }
+
+    if (useUtcFallback) {
+      const cached = this.playbackIndexCache.get(deviceId);
+      const uid =
+        cached && Date.now() - cached.updatedAt < 10 * 60_000
+          ? cached.clientId
+          : await this.getPlaybackUserId(baseUrl, token, terminalUuid, deviceId).catch(() => 1);
+      let utcIndexed = false;
+      let utcOffset = 0;
+      for (let page = 0; page < 15; page++) {
+        const res = await this.servicesSync(baseUrl, token, terminalUuid, deviceId, [
+          {
+            method: "searchVideoWithUTC",
+            params: {
+              playback: {
+                search_video_with_utc: {
+                  channel: 0,
+                  start_time: startSec,
+                  end_time: endSec,
+                  start_index: utcOffset,
+                  end_index: utcOffset + PAGE_SIZE - 1,
+                  id: uid,
+                },
+              },
+            },
+          },
+        ]);
+        const utcRes = res[0];
+        const utcCode = utcRes ? getErrorCode(utcRes) : -1;
+        if (utcCode !== 0) {
+          if (utcCode !== -71112 && utcCode !== -40210 && utcCode !== -40106) {
+            hardErrorCode = hardErrorCode ?? utcCode;
+          }
+          break;
+        }
+        utcIndexed = true;
+        const utcPlayback = ((utcRes?.result ?? {}) as Record<string, unknown>).playback as
+          | Record<string, unknown>
+          | undefined;
+        const parsedUtc = parseVideoSegments(
+          utcPlayback?.search_video_with_utc ?? utcPlayback?.search_video_results,
+          offsetMs,
+        );
+        segments.push(...parsedUtc);
+        utcOffset += parsedUtc.length;
+        const hasMore = Number(utcPlayback?.to_be_continued ?? 0) === 1;
+        if (parsedUtc.length === 0 || (!hasMore && parsedUtc.length < PAGE_SIZE)) break;
+      }
+      if (utcIndexed) {
+        this.playbackIndexCache.set(deviceId, {
+          clientId: uid,
+          startSec,
+          endSec,
+          updatedAt: Date.now(),
         });
       }
     }
-    clips.sort((a, b) => a.start - b.start || a.end - b.end);
-    return { date: dateYmd, timezone, clips };
+
+    if (events.length === 0 && segments.length === 0 && hardErrorCode !== null) {
+      throw new TapoCloudError(
+        this.deviceErrorMessage(hardErrorCode, "recordings_read_error"),
+        hardErrorCode,
+      );
+    }
+
+    // Remove generic event segments (type 2) that duplicate a richly-typed detection event.
+    const dedupedSegments =
+      events.length > 0
+        ? segments.filter((seg) => {
+            if (seg.type === 1) return true;
+            return !events.some(
+              (ev) => Math.abs(ev.start - seg.start) <= 2 && Math.abs(ev.end - seg.end) <= 2,
+            );
+          })
+        : segments;
+
+    events.sort((a, b) => b.start - a.start || b.end - a.end);
+    dedupedSegments.sort((a, b) => b.start - a.start || b.end - a.end);
+
+    return {
+      date: dateYmd,
+      timezone,
+      clips: [...events, ...dedupedSegments],
+      eventsCount: events.length,
+      segmentsCount: dedupedSegments.length,
+    };
+  }
+
+  /**
+   * Allocates (or reuses) a camera playback client_id and ensures the camera has
+   * indexed the requested time range via searchVideoWithUTC. Tapo C200 firmware
+   * returns an immediate empty stream_status="finished" on CIPC playback unless
+   * searchVideoWithUTC has been invoked with that client_id first.
+   */
+  async preparePlaybackSession(
+    baseUrl: string,
+    token: string,
+    terminalUuid: string,
+    deviceId: string,
+    startSec: number,
+    endSec: number,
+    opts?: { forceRefresh?: boolean },
+  ): Promise<{ clientId: number; fromCache: boolean }> {
+    const now = Date.now();
+    const cached = this.playbackIndexCache.get(deviceId);
+    if (
+      !opts?.forceRefresh &&
+      cached &&
+      now - cached.updatedAt < 10 * 60_000 &&
+      cached.startSec <= startSec &&
+      cached.endSec >= endSec
+    ) {
+      return { clientId: cached.clientId, fromCache: true };
+    }
+
+    const clientId =
+      !opts?.forceRefresh && cached && now - cached.updatedAt < 10 * 60_000
+        ? cached.clientId
+        : await this.getPlaybackUserId(baseUrl, token, terminalUuid, deviceId).catch((err) => {
+            console.warn("[playback] getPlaybackUserId failed, falling back to 1:", err);
+            return 1;
+          });
+
+    const rangeStart = Math.max(0, startSec - 60);
+    const rangeEnd = Math.max(rangeStart + 60, endSec + 60);
+    try {
+      await this.servicesSync(baseUrl, token, terminalUuid, deviceId, [
+        {
+          method: "searchVideoWithUTC",
+          params: {
+            playback: {
+              search_video_with_utc: {
+                channel: 0,
+                start_time: rangeStart,
+                end_time: rangeEnd,
+                start_index: 0,
+                end_index: 10,
+                id: clientId,
+              },
+            },
+          },
+        },
+      ]);
+    } catch (err) {
+      if (err instanceof TapoCloudError && err.isAuthError) throw err;
+      // Older models that don't require searchVideoWithUTC can still proceed with clientId.
+    }
+
+    this.playbackIndexCache.set(deviceId, {
+      clientId,
+      startSec: rangeStart,
+      endSec: rangeEnd,
+      updatedAt: Date.now(),
+    });
+    return { clientId, fromCache: false };
   }
 
   async getPlaybackUserId(
@@ -861,7 +2238,11 @@ export class TapoCloudClient {
     if (code !== 0) {
       throw new TapoCloudError(this.deviceErrorMessage(code, "playback_uid_error"), code);
     }
-    const uid = Number(((res[0]?.result ?? {}) as Record<string, unknown>).user_id ?? 0);
+    const resObj = (res[0]?.result ?? {}) as Record<string, unknown>;
+    const sysObj = (resObj.system as Record<string, unknown> | undefined)?.get_user_id as
+      | Record<string, unknown>
+      | undefined;
+    const uid = Number(resObj.user_id ?? sysObj?.user_id ?? 0);
     if (!uid) throw new TapoCloudError(tServer(this.getLang(), "playback_uid_missing"));
     return uid;
   }
@@ -1086,6 +2467,27 @@ export function writeRelayAudioFrame(sock: tls.TLSSocket, sessionId: string, tsB
     "ascii",
   );
   sock.write(Buffer.concat([head, tsBytes, Buffer.from("\r\n", "ascii")]));
+}
+
+export function writeRelaySequenceAck(
+  sock: tls.TLSSocket,
+  receivedSeq: number,
+  sessionId?: string,
+): void {
+  if (sock.destroyed || !Number.isFinite(receivedSeq) || receivedSeq < 0) return;
+  const body = Buffer.from(
+    JSON.stringify({
+      type: "notification",
+      params: { event_type: "stream_sequence" },
+    }),
+    "utf8",
+  );
+  const sessionHeader = sessionId ? `X-Session-Id: ${sessionId}\r\n` : "";
+  const head = Buffer.from(
+    `----client-stream-boundary--\r\nX-Data-Received: ${receivedSeq}\r\n${sessionHeader}Content-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n`,
+    "ascii",
+  );
+  sock.write(Buffer.concat([head, body, Buffer.from("\r\n", "ascii")]));
 }
 
 export function attachSocketInactivityTimeout(

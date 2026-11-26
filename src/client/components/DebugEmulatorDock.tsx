@@ -26,7 +26,7 @@ import {
 } from "@/components/ui/select";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "@/components/ui/tabs";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "@/components/ui/tooltip";
-import { groupHealthMeta } from "@/lib/api";
+import { cameraLabel, groupHealthMeta } from "@/lib/api";
 import {
   addEmulatedCamera,
   addEmulatedStore,
@@ -36,6 +36,7 @@ import {
   EMPTY_EMULATED_STATE,
   isSimulatedStore,
   setEmulatedCamerasMode,
+  setEmulatedVideoSource,
   type EmulatedCamera,
   type EmulatedState,
   type SimulatedCameraStatus,
@@ -43,12 +44,13 @@ import {
 } from "@/lib/debug-emulator";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
-import type { Store } from "../../shared/types";
+import type { CameraMeta, Store } from "../../shared/types";
 
 interface DebugEmulatorDockProps {
   emulated: EmulatedState;
   allStores: Store[];
   realStores: Store[];
+  realCameras: CameraMeta[];
   storeOnlineCounts: Map<string, number>;
   onChange: (next: EmulatedState) => void;
   onSelectStoreFilter: (storeId: string) => void;
@@ -72,6 +74,7 @@ export function DebugEmulatorDock({
   emulated,
   allStores,
   realStores,
+  realCameras,
   storeOnlineCounts,
   onChange,
   onSelectStoreFilter,
@@ -118,6 +121,22 @@ export function DebugEmulatorDock({
   const inlineAssignItems = [
     { label: t("filterUnassigned"), value: "__none__" },
     ...allStores.map((s) => ({ label: s.name, value: s.id })),
+  ];
+
+  const videoSourceValue = emulated.videoSource ?? "auto";
+  const videoSourceItems = [
+    {
+      label:
+        realCameras.length > 0
+          ? t("emuVideoSourceAuto")
+          : t("emuVideoSourceAutoEmpty"),
+      value: "auto",
+    },
+    ...realCameras.map((c) => ({
+      label: t("emuVideoSourceCopy", { name: cameraLabel(c) }),
+      value: c.deviceId,
+    })),
+    { label: t("emuVideoSourceSynthetic"), value: "synthetic" },
   ];
 
   const storeCamCountItems = [
@@ -293,8 +312,32 @@ export function DebugEmulatorDock({
           </TabsTab>
         </TabsList>
 
-        {/* Tab 1: Presets + Add Group + Add Camera */}
+        {/* Tab 1: Presets + Video Source + Add Group + Add Camera */}
         <TabsPanel className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pr-0.5" value="generator">
+          {/* Video Source Selector (mirror live camera vs synthetic) */}
+          <div className="flex flex-col gap-1.5 rounded-lg border bg-muted/20 p-2.5">
+            <span className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
+              <VideoIcon aria-hidden="true" className="size-3.5" />
+              {t("emuVideoSourceTitle")}
+            </span>
+            <Select
+              items={videoSourceItems}
+              onValueChange={(v) => onChange(setEmulatedVideoSource(emulated, String(v)))}
+              value={videoSourceValue}
+            >
+              <SelectTrigger className="min-w-0" size="sm">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectPopup>
+                {videoSourceItems.map((it) => (
+                  <SelectItem key={it.value} value={it.value}>
+                    {it.label}
+                  </SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+          </div>
+
           {/* Quick Scale Presets */}
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center justify-between text-[11px] font-medium text-muted-foreground">

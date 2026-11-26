@@ -5,6 +5,8 @@ import { normalizeLanguagePreference, resolveLanguage, tServer } from "../shared
 import type {
   AuthState,
   CameraMeta,
+  CameraOrientation,
+  CameraSettingsPatch,
   DashboardBootstrap,
   DashboardSettings,
   ResolvedLanguage,
@@ -18,7 +20,8 @@ import {
   type RunningTapoServer,
   type StartTapoServerOptions,
 } from "./config";
-import { streamSdRecordingMp4 } from "./playback";
+import { createFfmpegInstaller } from "./ffmpeg-installer";
+import { captureSdRecordingMp4Buffer, streamSdRecordingMp4 } from "./playback";
 import { AppStorage, type StoredSession } from "./storage";
 import { StreamManager } from "./stream-manager";
 import { type CloudFamily, TapoCloudClient, TapoCloudError } from "./tapo-cloud";
@@ -63,12 +66,6 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
     options.directDataDir ??
     (options.dataDir !== undefined ? false : defaults.directDataDir ?? false);
   const certPath = options.certPath ?? defaults.certPath!;
-  const resolvedFfmpegPath =
-    options.ffmpegPath !== undefined
-      ? findFfmpegBinary(options.ffmpegPath)
-      : defaults.ffmpegPath
-        ? findFfmpegBinary(defaults.ffmpegPath)
-        : findFfmpegBinary();
   const staticDir = options.staticDir ?? defaults.staticDir;
   const resolvedStaticDir = staticDir ? resolve(staticDir) : "";
   const indexHtmlPath = resolvedStaticDir ? join(resolvedStaticDir, "index.html") : "";
@@ -87,6 +84,15 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
 
   const accessGuard = createAccessGuard(accessPassword);
   const storage = new AppStorage(dataDir, { directDataDir });
+  const ffmpegInstallDir = join(storage.dataDir, "bin");
+
+  const resolveCurrentFfmpeg = (): string | null =>
+    options.ffmpegPath !== undefined
+      ? findFfmpegBinary(options.ffmpegPath, [ffmpegInstallDir])
+      : defaults.ffmpegPath
+        ? findFfmpegBinary(defaults.ffmpegPath, [ffmpegInstallDir])
+        : findFfmpegBinary(undefined, [ffmpegInstallDir]);
+  let resolvedFfmpegPath = resolveCurrentFfmpeg();
 
   let session: StoredSession | null = storage.loadSession();
   const workspace = storage.loadWorkspace();
@@ -129,11 +135,40 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
 
   const getSettings = (): DashboardSettings => workspace.settings;
 
-  const capabilities: RuntimeCapabilities = {
-    ffmpegAvailable: Boolean(resolvedFfmpegPath),
-    debugEmulatorEnabled,
-    desktopApp,
-    appVersion,
+  const streams = new StreamManager(
+    client,
+    getCreds,
+    getSettings,
+    handleAuthExpired,
+    {
+      ffmpegPath: () => resolvedFfmpegPath,
+      getLang: getServerLang,
+    },
+  );
+
+  const ffmpegInstaller = createFfmpegInstaller({
+    installDir: ffmpegInstallDir,
+    resolveExisting: () => {
+      const found = resolveCurrentFfmpeg();
+      resolvedFfmpegPath = found;
+      return found;
+    },
+    getLang: getServerLang,
+    onInstalled: (binaryPath) => {
+      resolvedFfmpegPath = binaryPath;
+      streams.notifyGridSettingsChanged();
+    },
+  });
+
+  const currentCapabilities = (): RuntimeCapabilities => {
+    const installState = ffmpegInstaller.getState();
+    return {
+      ffmpegAvailable: Boolean(resolvedFfmpegPath),
+      ffmpegInstall: installState,
+      debugEmulatorEnabled,
+      desktopApp,
+      appVersion,
+    };
   };
 
   async function handleAuthExpired(): Promise<boolean> {
@@ -162,17 +197,6 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
     return false;
   }
 
-  const streams = new StreamManager(
-    client,
-    getCreds,
-    getSettings,
-    handleAuthExpired,
-    {
-      ffmpegPath: resolvedFfmpegPath,
-      getLang: getServerLang,
-    },
-  );
-
   function currentAuthState(): AuthState {
     if (pendingMfa) return pendingMfa;
     if (session) {
@@ -189,10 +213,16 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
   }
 
   function enrichedCameras(): CameraMeta[] {
-    return cameras.map((c) => ({
-      ...c,
-      customName: workspace.customNames[c.deviceId],
-    }));
+    return cameras.map((c) => {
+      const orientation = workspace.cameraOrientations[c.deviceId];
+      return {
+        ...c,
+        customName: workspace.customNames[c.deviceId],
+        ...(orientation && (orientation.rotate180 || orientation.invertPtz)
+          ? { orientation }
+          : {}),
+      };
+    });
   }
 
   function buildStores(): Store[] {
@@ -485,7 +515,7 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
                 logs: [],
                 media: [],
                 mediaDir: "",
-                capabilities,
+                capabilities: currentCapabilities(),
                 updateState: {
                   currentVersion: currentUpdate.currentVersion,
                   phase: "idle",
@@ -511,7 +541,7 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
               logs: streams.getLogs(),
               media: storage.listMedia(),
               mediaDir: storage.mediaDir,
-              capabilities,
+              capabilities: currentCapabilities(),
               updateState: updater.getState(),
             };
             return jsonOk(bootstrap);
@@ -762,7 +792,11 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
           const camPatchMatch = pathname.match(/^\/api\/cameras\/([^/]+)$/);
           if (camPatchMatch && req.method === "PATCH") {
             const deviceId = decodeURIComponent(camPatchMatch[1]!);
-            const body = (await req.json()) as { customName?: string; storeId?: string | null };
+            const body = (await req.json()) as {
+              customName?: string;
+              storeId?: string | null;
+              orientation?: CameraOrientation;
+            };
             if (body.customName !== undefined) {
               const clean = body.customName.trim();
               if (clean && session) {
@@ -794,6 +828,17 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
                 delete workspace.roomOverrides[deviceId];
               } else {
                 workspace.roomOverrides[deviceId] = body.storeId ?? "";
+              }
+            }
+            if (body.orientation !== undefined) {
+              const nextOrientation: CameraOrientation = {
+                rotate180: Boolean(body.orientation.rotate180),
+                invertPtz: Boolean(body.orientation.invertPtz),
+              };
+              if (!nextOrientation.rotate180 && !nextOrientation.invertPtz) {
+                delete workspace.cameraOrientations[deviceId];
+              } else {
+                workspace.cameraOrientations[deviceId] = nextOrientation;
               }
             }
             storage.saveWorkspace(workspace);
@@ -840,6 +885,18 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
             return jsonOk(await updater.applyUpdate());
           }
 
+          if (pathname === "/api/system/ffmpeg" && req.method === "GET") {
+            return jsonOk(ffmpegInstaller.getState());
+          }
+
+          if (pathname === "/api/system/ffmpeg/install" && req.method === "POST") {
+            const cur = ffmpegInstaller.getState();
+            if (!cur.available && cur.supported && cur.phase !== "downloading" && cur.phase !== "verifying") {
+              void ffmpegInstaller.install();
+            }
+            return jsonOk(ffmpegInstaller.getState());
+          }
+
           const audioCfgMatch = pathname.match(/^\/api\/cameras\/([^/]+)\/audio-config$/);
           if (audioCfgMatch && req.method === "POST") {
             if (!session) return jsonErr(tServer(reqLang, "auth_required"), 401);
@@ -864,7 +921,9 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
             const deviceId = decodeURIComponent(saveSnapMatch[1]!);
             const cam = findCamera(deviceId);
             if (!cam) return jsonErr(tServer(reqLang, "camera_not_found"), 404);
-            const jpeg = await streams.captureSnapshot(deviceId);
+            const jpeg = await streams.captureSnapshot(deviceId, {
+              rotate180: Boolean(cam.orientation?.rotate180),
+            });
             const cameraName = cam.customName?.trim() || cam.alias || cam.deviceModel;
             const item = storage.saveMediaFile(
               {
@@ -891,7 +950,9 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
             const deviceId = decodeURIComponent(saveClipMatch[1]!);
             const cam = findCamera(deviceId);
             if (!cam) return jsonErr(tServer(reqLang, "camera_not_found"), 404);
-            const mp4 = await streams.captureMp4Clip(deviceId, 4);
+            const mp4 = await streams.captureMp4Clip(deviceId, 4, {
+              rotate180: Boolean(cam.orientation?.rotate180),
+            });
             const cameraName = cam.customName?.trim() || cam.alias || cam.deviceModel;
             const item = storage.saveMediaFile(
               {
@@ -978,6 +1039,135 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
             return jsonOk(snap);
           }
 
+          const camSettingsMatch = pathname.match(/^\/api\/cameras\/([^/]+)\/settings$/);
+          if (camSettingsMatch && req.method === "GET") {
+            if (!session) return jsonErr(tServer(reqLang, "auth_required"), 401);
+            const deviceId = decodeURIComponent(camSettingsMatch[1]!);
+            const snap = await client.getCameraSettings(
+              session.baseUrl,
+              session.token,
+              session.terminalUuid,
+              deviceId,
+            );
+            return jsonOk(snap);
+          }
+
+          if (camSettingsMatch && req.method === "PATCH") {
+            if (!session) return jsonErr(tServer(reqLang, "auth_required"), 401);
+            const deviceId = decodeURIComponent(camSettingsMatch[1]!);
+            const body = (await req.json()) as CameraSettingsPatch;
+            const snap = await client.updateCameraSettings(
+              session.baseUrl,
+              session.token,
+              session.terminalUuid,
+              deviceId,
+              body,
+            );
+            if (body.alarm?.enabled !== undefined && Object.keys(body).length === 1) {
+              streams.pushLocalizedLog(
+                "info",
+                "log_alarm_toggled",
+                { state: tServer(reqLang, body.alarm.enabled ? "state_on" : "state_off") },
+                deviceId,
+              );
+            } else {
+              streams.pushLocalizedLog("info", "log_settings_updated", undefined, deviceId);
+            }
+            return jsonOk(snap);
+          }
+
+          const rebootMatch = pathname.match(/^\/api\/cameras\/([^/]+)\/reboot$/);
+          if (rebootMatch && req.method === "POST") {
+            if (!session) return jsonErr(tServer(reqLang, "auth_required"), 401);
+            const deviceId = decodeURIComponent(rebootMatch[1]!);
+            await client.rebootCamera(
+              session.baseUrl,
+              session.token,
+              session.terminalUuid,
+              deviceId,
+            );
+            streams.pushLocalizedLog("warn", "log_camera_rebooted", undefined, deviceId);
+            return jsonOk({ ok: true });
+          }
+
+          const manualAlarmMatch = pathname.match(/^\/api\/cameras\/([^/]+)\/alarm\/manual$/);
+          if (manualAlarmMatch && req.method === "POST") {
+            if (!session) return jsonErr(tServer(reqLang, "auth_required"), 401);
+            const deviceId = decodeURIComponent(manualAlarmMatch[1]!);
+            const body = (await req.json()) as { action?: string };
+            const action = body.action === "stop" ? "stop" : "start";
+            await client.triggerManualAlarm(
+              session.baseUrl,
+              session.token,
+              session.terminalUuid,
+              deviceId,
+              action,
+            );
+            streams.pushLocalizedLog(
+              "warn",
+              "log_siren_triggered",
+              { state: tServer(reqLang, action === "start" ? "state_on" : "state_off") },
+              deviceId,
+            );
+            return jsonOk({ ok: true, action });
+          }
+
+          const calibrateMatch = pathname.match(/^\/api\/cameras\/([^/]+)\/ptz\/calibrate$/);
+          if (calibrateMatch && req.method === "POST") {
+            if (!session) return jsonErr(tServer(reqLang, "auth_required"), 401);
+            const deviceId = decodeURIComponent(calibrateMatch[1]!);
+            await client.calibrateMotor(
+              session.baseUrl,
+              session.token,
+              session.terminalUuid,
+              deviceId,
+            );
+            return jsonOk({ ok: true });
+          }
+
+          const presetsMatch = pathname.match(/^\/api\/cameras\/([^/]+)\/ptz\/presets$/);
+          if (presetsMatch && req.method === "POST") {
+            if (!session) return jsonErr(tServer(reqLang, "auth_required"), 401);
+            const deviceId = decodeURIComponent(presetsMatch[1]!);
+            const body = (await req.json()) as {
+              action?: "goto" | "save" | "delete";
+              id?: string;
+              name?: string;
+            };
+            if (body.action === "save") {
+              const name = (body.name ?? "").trim();
+              if (!name) return jsonErr(tServer(reqLang, "preset_error_code", { code: 400 }), 400);
+              const presets = await client.savePreset(
+                session.baseUrl,
+                session.token,
+                session.terminalUuid,
+                deviceId,
+                name,
+              );
+              return jsonOk({ presets });
+            }
+            if (body.action === "delete") {
+              if (!body.id) return jsonErr(tServer(reqLang, "preset_error_code", { code: 400 }), 400);
+              const presets = await client.deletePreset(
+                session.baseUrl,
+                session.token,
+                session.terminalUuid,
+                deviceId,
+                body.id,
+              );
+              return jsonOk({ presets });
+            }
+            if (!body.id) return jsonErr(tServer(reqLang, "preset_error_code", { code: 400 }), 400);
+            await client.goToPreset(
+              session.baseUrl,
+              session.token,
+              session.terminalUuid,
+              deviceId,
+              body.id,
+            );
+            return jsonOk({ ok: true });
+          }
+
           const privMatch = pathname.match(/^\/api\/cameras\/([^/]+)\/privacy$/);
           if (privMatch && req.method === "POST") {
             if (!session) return jsonErr(tServer(reqLang, "auth_required"), 401);
@@ -1048,6 +1238,56 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
             return jsonOk(data);
           }
 
+          const recSaveMatch = pathname.match(/^\/api\/cameras\/([^/]+)\/recordings\/save$/);
+          if (recSaveMatch && req.method === "POST") {
+            if (!session) return jsonErr(tServer(reqLang, "auth_required"), 401);
+            const deviceId = decodeURIComponent(recSaveMatch[1]!);
+            const cam = findCamera(deviceId);
+            if (!cam) return jsonErr(tServer(reqLang, "camera_not_found"), 404);
+            const body = (await req.json()) as { start?: number; end?: number };
+            const start = Number(body.start ?? 0);
+            const end = Number(body.end ?? 0);
+            if (!start || !end || end <= start) {
+              return jsonErr(tServer(reqLang, "invalid_time_range"));
+            }
+            const mp4 = await captureSdRecordingMp4Buffer({
+              client,
+              baseUrl: session.baseUrl,
+              token: session.token,
+              terminalUuid: session.terminalUuid,
+              device: cam,
+              start,
+              end,
+              rotate180: Boolean(cam.orientation?.rotate180),
+              ffmpegPath: resolvedFfmpegPath,
+              getLang: () => reqLang,
+              signal: req.signal,
+              registerCleanup: (cleanup) => streams.registerCleanup(cleanup),
+              acquirePlaybackSlot: (abortFn) => streams.acquirePlaybackSlot(deviceId, abortFn),
+              suspendLiveStream: () => streams.suspendLiveWorker(deviceId),
+            });
+            const cameraName = cam.customName?.trim() || cam.alias || cam.deviceModel;
+            const item = storage.saveMediaFile(
+              {
+                kind: "clip",
+                deviceId,
+                cameraName,
+                storeName: storeNameForCamera(deviceId),
+                mimeType: "video/mp4",
+                durationSec: Math.max(1, Math.round(end - start)),
+              },
+              "mp4",
+              mp4,
+            );
+            streams.pushLocalizedLog(
+              "info",
+              "log_clip_saved",
+              { filename: item.filename },
+              deviceId,
+            );
+            return jsonOk({ item, media: storage.listMedia(), mediaDir: storage.mediaDir });
+          }
+
           const recPlayMatch = pathname.match(/^\/api\/cameras\/([^/]+)\/recordings\/play$/);
           if (recPlayMatch && req.method === "GET") {
             if (!session) return jsonErr(tServer(reqLang, "auth_required"), 401);
@@ -1059,6 +1299,7 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
             if (!start || !end || end <= start) {
               return jsonErr(tServer(reqLang, "invalid_time_range"));
             }
+            const isDownload = searchParams.get("download") === "1";
             return await streamSdRecordingMp4({
               client,
               baseUrl: session.baseUrl,
@@ -1067,11 +1308,14 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
               device: cam,
               start,
               end,
-              download: searchParams.get("download") === "1",
+              download: isDownload,
+              rotate180: isDownload && Boolean(cam.orientation?.rotate180),
               ffmpegPath: resolvedFfmpegPath,
               getLang: () => reqLang,
               signal: req.signal,
               registerCleanup: (cleanup) => streams.registerCleanup(cleanup),
+              acquirePlaybackSlot: (abortFn) => streams.acquirePlaybackSlot(deviceId, abortFn),
+              suspendLiveStream: () => streams.suspendLiveWorker(deviceId),
             });
           }
 
@@ -1161,7 +1405,9 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
             const deviceId = decodeURIComponent(snapMatch[1]!);
             const cam = findCamera(deviceId);
             if (!cam) return jsonErr(tServer(reqLang, "camera_not_found"), 404);
-            const jpeg = await streams.captureSnapshot(deviceId);
+            const jpeg = await streams.captureSnapshot(deviceId, {
+              rotate180: Boolean(cam.orientation?.rotate180),
+            });
             return new Response(new Uint8Array(jpeg), {
               headers: {
                 "Content-Type": "image/jpeg",
@@ -1176,7 +1422,9 @@ export function startTapoServer(options: StartTapoServerOptions = {}): RunningTa
             const deviceId = decodeURIComponent(clipMatch[1]!);
             const cam = findCamera(deviceId);
             if (!cam) return jsonErr(tServer(reqLang, "camera_not_found"), 404);
-            const mp4 = await streams.captureMp4Clip(deviceId, 4);
+            const mp4 = await streams.captureMp4Clip(deviceId, 4, {
+              rotate180: Boolean(cam.orientation?.rotate180),
+            });
             return new Response(new Uint8Array(mp4), {
               headers: {
                 "Content-Type": "video/mp4",

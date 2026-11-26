@@ -5,6 +5,15 @@ import { Spinner } from "@/components/ui/spinner";
 import { canUseWebCodecs } from "@/lib/api";
 import { isSimulatedCamera } from "@/lib/debug-emulator";
 import { useI18n } from "@/lib/i18n";
+import {
+  acquireMirrorLeader,
+  getLiveMirrorElementSize,
+  getLiveMirrorSource,
+  isLiveMirrorElementReady,
+  registerLiveMirrorSource,
+  releaseMirrorLeader,
+  subscribeLiveMirrorChange,
+} from "@/lib/live-mirror";
 import { cn } from "@/lib/utils";
 import type { GridTransport, RelayStatus } from "../../shared/types";
 
@@ -12,6 +21,7 @@ class WebCodecsUnsupportedError extends Error {}
 
 interface VideoStreamStageProps {
   deviceId: string;
+  mirrorDeviceId?: string;
   quality: "grid" | "hd";
   transport: GridTransport;
   targetFps?: number;
@@ -19,11 +29,27 @@ interface VideoStreamStageProps {
   telemetryStatus?: RelayStatus;
   lastError?: string | null;
   panOffset?: { x: number; y: number };
+  rotate180?: boolean;
   className?: string;
+}
+
+function mediaRotationStyle(
+  rotate180: boolean,
+  panOffset?: { x: number; y: number },
+): React.CSSProperties | undefined {
+  const parts: string[] = [];
+  if (panOffset && (panOffset.x !== 0 || panOffset.y !== 0)) {
+    parts.push(`scale(1.12) translate(${panOffset.x}px, ${panOffset.y}px)`);
+  }
+  if (rotate180) {
+    parts.push("rotate(180deg)");
+  }
+  return parts.length > 0 ? { transform: parts.join(" "), transformOrigin: "center" } : undefined;
 }
 
 export function VideoStreamStage({
   deviceId,
+  mirrorDeviceId,
   quality,
   transport,
   targetFps = 30,
@@ -31,6 +57,7 @@ export function VideoStreamStage({
   telemetryStatus,
   lastError,
   panOffset,
+  rotate180 = false,
   className,
 }: VideoStreamStageProps): React.ReactElement {
   const { t } = useI18n();
@@ -39,7 +66,7 @@ export function VideoStreamStage({
   // Reset fallback preference whenever camera or explicit transport setting changes.
   useEffect(() => {
     setFallbackActive(false);
-  }, [deviceId, quality, transport]);
+  }, [deviceId, mirrorDeviceId, quality, transport]);
 
   const isSim = isSimulatedCamera(deviceId);
   const useWebCodecs = canUseWebCodecs() && transport === "webcodecs" && !fallbackActive;
@@ -77,11 +104,23 @@ export function VideoStreamStage({
         className,
       )}
     >
-      {isSim ? (
+      {isSim && mirrorDeviceId ? (
+        <MirroredStreamStage
+          lastError={lastError}
+          panOffset={panOffset}
+          quality={quality}
+          rotate180={rotate180}
+          sourceDeviceId={mirrorDeviceId}
+          targetFps={targetFps}
+          telemetryStatus={telemetryStatus}
+          transport={transport}
+        />
+      ) : isSim ? (
         <SimulatedStreamStage
           deviceId={deviceId}
           panOffset={panOffset}
           quality={quality}
+          rotate180={rotate180}
           targetFps={targetFps}
         />
       ) : useWebCodecs ? (
@@ -91,13 +130,19 @@ export function VideoStreamStage({
           lastError={lastError}
           onFallback={() => setFallbackActive(true)}
           quality={quality}
+          rotate180={rotate180}
           targetFps={quality === "hd" ? 60 : targetFps}
           telemetryStatus={telemetryStatus}
         />
       ) : quality === "hd" ? (
-        <MseFmp4Stage deviceId={deviceId} />
+        <MseFmp4Stage deviceId={deviceId} rotate180={rotate180} />
       ) : (
-        <MjpegStage deviceId={deviceId} lastError={lastError} telemetryStatus={telemetryStatus} />
+        <MjpegStage
+          deviceId={deviceId}
+          lastError={lastError}
+          rotate180={rotate180}
+          telemetryStatus={telemetryStatus}
+        />
       )}
     </div>
   );
@@ -108,6 +153,9 @@ function MediabunnyTsStage({
   quality,
   targetFps,
   keyframeOnly,
+  rotate180,
+  panOffset,
+  isMirrorLeader = false,
   telemetryStatus,
   lastError,
   onFallback,
@@ -116,6 +164,9 @@ function MediabunnyTsStage({
   quality: "grid" | "hd";
   targetFps: number;
   keyframeOnly: boolean;
+  rotate180: boolean;
+  panOffset?: { x: number; y: number };
+  isMirrorLeader?: boolean;
   telemetryStatus?: RelayStatus;
   lastError?: string | null;
   onFallback: () => void;
@@ -132,6 +183,12 @@ function MediabunnyTsStage({
   keyframeOnlyRef.current = keyframeOnly;
   onFallbackRef.current = onFallback;
   tRef.current = t;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    return registerLiveMirrorSource(deviceId, canvas, !isMirrorLeader);
+  }, [deviceId, isMirrorLeader]);
 
   useEffect(() => {
     setHasFrame(false);
@@ -370,7 +427,11 @@ function MediabunnyTsStage({
 
   return (
     <>
-      <canvas ref={canvasRef} className="block h-full w-full object-contain" />
+      <canvas
+        ref={canvasRef}
+        className="block h-full w-full object-contain"
+        style={mediaRotationStyle(rotate180, panOffset)}
+      />
       {!hasFrame && (
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 bg-neutral-950/70 text-xs text-muted-foreground">
           {telemetryStatus === "offline" ? (
@@ -393,13 +454,29 @@ function MediabunnyTsStage({
   );
 }
 
-function MseFmp4Stage({ deviceId }: { deviceId: string }): React.ReactElement {
+function MseFmp4Stage({
+  deviceId,
+  rotate180,
+  panOffset,
+  isMirrorLeader = false,
+}: {
+  deviceId: string;
+  rotate180: boolean;
+  panOffset?: { x: number; y: number };
+  isMirrorLeader?: boolean;
+}): React.ReactElement {
   const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [connecting, setConnecting] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const tRef = useRef(t);
   tRef.current = t;
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    return registerLiveMirrorSource(deviceId, video, !isMirrorLeader);
+  }, [deviceId, isMirrorLeader]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -555,7 +632,14 @@ function MseFmp4Stage({ deviceId }: { deviceId: string }): React.ReactElement {
 
   return (
     <>
-      <video ref={videoRef} autoPlay muted playsInline className="block h-full w-full object-contain" />
+      <video
+        ref={videoRef}
+        autoPlay
+        muted
+        playsInline
+        className="block h-full w-full object-contain"
+        style={mediaRotationStyle(rotate180, panOffset)}
+      />
       {(connecting || errorMsg) && (
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 bg-neutral-950/70 text-xs text-muted-foreground">
           {errorMsg ? (
@@ -574,16 +658,29 @@ function MseFmp4Stage({ deviceId }: { deviceId: string }): React.ReactElement {
 
 function MjpegStage({
   deviceId,
+  rotate180,
+  panOffset,
+  isMirrorLeader = false,
   telemetryStatus,
   lastError,
 }: {
   deviceId: string;
+  rotate180: boolean;
+  panOffset?: { x: number; y: number };
+  isMirrorLeader?: boolean;
   telemetryStatus?: RelayStatus;
   lastError?: string | null;
 }): React.ReactElement {
   const { t } = useI18n();
+  const imgRef = useRef<HTMLImageElement | null>(null);
   const [nonce, setNonce] = useState(0);
   const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    const img = imgRef.current;
+    if (!img) return;
+    return registerLiveMirrorSource(deviceId, img, !isMirrorLeader);
+  }, [deviceId, isMirrorLeader]);
 
   return (
     <>
@@ -596,7 +693,9 @@ function MjpegStage({
           setTimeout(() => setNonce((n) => n + 1), 2500);
         }}
         onLoad={() => setLoaded(true)}
+        ref={imgRef}
         src={`/api/stream/${encodeURIComponent(deviceId)}/mjpeg?v=${nonce}`}
+        style={mediaRotationStyle(rotate180, panOffset)}
       />
       {!loaded && (
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 bg-neutral-950/70 text-xs text-muted-foreground">
@@ -620,6 +719,153 @@ function MjpegStage({
   );
 }
 
+/**
+ * Mirrors an active real camera's live frames into an emulated camera tile with zero extra
+ * decoders when the real camera is mounted. If the real camera is not currently mounted (e.g.
+ * filtered to a simulated store or opened in Focus view), one simulated tile automatically acts
+ * as the mirror leader and streams the real camera once for all mirrored tiles.
+ */
+function MirroredStreamStage({
+  sourceDeviceId,
+  quality,
+  transport,
+  targetFps,
+  rotate180,
+  panOffset,
+  telemetryStatus,
+  lastError,
+}: {
+  sourceDeviceId: string;
+  quality: "grid" | "hd";
+  transport: GridTransport;
+  targetFps: number;
+  rotate180: boolean;
+  panOffset?: { x: number; y: number };
+  telemetryStatus?: RelayStatus;
+  lastError?: string | null;
+}): React.ReactElement {
+  const { t } = useI18n();
+  const tokenRef = useRef<symbol>(Symbol("mirror-stage"));
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [isLeader, setIsLeader] = useState(false);
+  const [fallbackActive, setFallbackActive] = useState(false);
+  const [hasFrame, setHasFrame] = useState(false);
+
+  useEffect(() => {
+    setFallbackActive(false);
+  }, [sourceDeviceId, quality, transport]);
+
+  useEffect(() => {
+    const token = tokenRef.current;
+    const evaluate = () => {
+      setIsLeader(acquireMirrorLeader(sourceDeviceId, token));
+    };
+    evaluate();
+    const unsub = subscribeLiveMirrorChange(evaluate);
+    return () => {
+      unsub();
+      releaseMirrorLeader(sourceDeviceId, token);
+    };
+  }, [sourceDeviceId]);
+
+  useEffect(() => {
+    if (isLeader) return;
+    setHasFrame(false);
+    let cancelled = false;
+    let rafId = 0;
+    let lastDrawAt = -Infinity;
+
+    const tick = (now: number) => {
+      if (cancelled) return;
+      rafId = requestAnimationFrame(tick);
+      const minInterval = targetFps >= 30 ? 30 : 1000 / Math.max(0.5, targetFps);
+      if (now - lastDrawAt < minInterval) return;
+
+      const src = getLiveMirrorSource(sourceDeviceId);
+      const canvas = canvasRef.current;
+      if (!src || !canvas || !isLiveMirrorElementReady(src)) return;
+
+      const { width, height } = getLiveMirrorElementSize(src);
+      if (width <= 0 || height <= 0) return;
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+      if (!ctx) return;
+      try {
+        ctx.drawImage(src, 0, 0, width, height);
+        lastDrawAt = now;
+        setHasFrame((prev) => (prev ? prev : true));
+      } catch {
+        // source may be transitioning
+      }
+    };
+
+    rafId = requestAnimationFrame(tick);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(rafId);
+    };
+  }, [isLeader, sourceDeviceId, targetFps]);
+
+  if (isLeader) {
+    const useWebCodecs = canUseWebCodecs() && transport === "webcodecs" && !fallbackActive;
+    if (useWebCodecs) {
+      return (
+        <MediabunnyTsStage
+          deviceId={sourceDeviceId}
+          isMirrorLeader
+          keyframeOnly={quality === "grid" && targetFps <= 1}
+          lastError={lastError}
+          onFallback={() => setFallbackActive(true)}
+          panOffset={panOffset}
+          quality={quality}
+          rotate180={rotate180}
+          targetFps={quality === "hd" ? 60 : targetFps}
+          telemetryStatus={telemetryStatus}
+        />
+      );
+    }
+    if (quality === "hd") {
+      return (
+        <MseFmp4Stage
+          deviceId={sourceDeviceId}
+          isMirrorLeader
+          panOffset={panOffset}
+          rotate180={rotate180}
+        />
+      );
+    }
+    return (
+      <MjpegStage
+        deviceId={sourceDeviceId}
+        isMirrorLeader
+        lastError={lastError}
+        panOffset={panOffset}
+        rotate180={rotate180}
+        telemetryStatus={telemetryStatus}
+      />
+    );
+  }
+
+  return (
+    <>
+      <canvas
+        className="block h-full w-full object-contain"
+        ref={canvasRef}
+        style={mediaRotationStyle(rotate180, panOffset)}
+      />
+      {!hasFrame && (
+        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 bg-neutral-950/70 text-xs text-muted-foreground">
+          <Spinner className="size-4" />
+          <span>{t("stageConnecting")}</span>
+        </div>
+      )}
+    </>
+  );
+}
+
 function hashSeed(input: string): number {
   let h = 2166136261;
   for (let i = 0; i < input.length; i++) {
@@ -634,11 +880,13 @@ function SimulatedStreamStage({
   quality,
   targetFps,
   panOffset,
+  rotate180,
 }: {
   deviceId: string;
   quality: "grid" | "hd";
   targetFps: number;
   panOffset?: { x: number; y: number };
+  rotate180: boolean;
 }): React.ReactElement {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const fpsRef = useRef(targetFps);
@@ -751,5 +999,11 @@ function SimulatedStreamStage({
     };
   }, [deviceId, quality]);
 
-  return <canvas ref={canvasRef} className="block h-full w-full object-contain" />;
+  return (
+    <canvas
+      ref={canvasRef}
+      className="block h-full w-full object-contain"
+      style={mediaRotationStyle(rotate180)}
+    />
+  );
 }

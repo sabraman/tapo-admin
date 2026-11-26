@@ -43,6 +43,7 @@ import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Form } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectItem,
@@ -61,14 +62,22 @@ import {
 import { Tabs, TabsList, TabsPanel, TabsTab } from "@/components/ui/tabs";
 import { toastManager } from "@/components/ui/toast";
 import { cameraLabel, findCameraStore, isCameraOnline } from "@/lib/api";
-import { formatRelayLog, formatTsTime, relayStatusMeta, useI18n } from "@/lib/i18n";
+import {
+  ffmpegInstallButtonLabel,
+  formatRelayLog,
+  formatTsTime,
+  relayStatusMeta,
+  useI18n,
+} from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import type {
   AppUpdateState,
   AuthState,
   CameraMeta,
+  CameraOrientation,
   CameraTelemetry,
   DashboardSettings,
+  FfmpegInstallState,
   GridFps,
   GridTransport,
   LanguagePreference,
@@ -87,7 +96,10 @@ interface CameraEditDialogProps {
   stores: Store[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onSave: (deviceId: string, payload: { customName: string; storeId: string | null }) => Promise<void>;
+  onSave: (
+    deviceId: string,
+    payload: { customName: string; storeId: string | null; orientation: CameraOrientation },
+  ) => Promise<void>;
 }
 
 export function CameraEditDialog({
@@ -100,6 +112,8 @@ export function CameraEditDialog({
   const { t } = useI18n();
   const [customName, setCustomName] = useState("");
   const [storeId, setStoreId] = useState<string>("__none__");
+  const [rotate180, setRotate180] = useState(false);
+  const [invertPtz, setInvertPtz] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -107,6 +121,8 @@ export function CameraEditDialog({
     setCustomName(camera.customName ?? camera.cloudNickname ?? camera.alias ?? "");
     const assigned = findCameraStore(stores, camera.deviceId);
     setStoreId(assigned?.id ?? "__none__");
+    setRotate180(Boolean(camera.orientation?.rotate180));
+    setInvertPtz(Boolean(camera.orientation?.invertPtz));
   }, [open, camera, stores]);
 
   const storeItems = [
@@ -122,6 +138,7 @@ export function CameraEditDialog({
       await onSave(camera.deviceId, {
         customName,
         storeId: storeId === "__none__" ? null : storeId,
+        orientation: { rotate180, invertPtz },
       });
       onOpenChange(false);
     } finally {
@@ -174,6 +191,34 @@ export function CameraEditDialog({
                 </SelectPopup>
               </Select>
             </Field>
+
+            <div className="flex flex-col gap-3 rounded-xl border bg-muted/20 p-3">
+              <label className="flex items-start justify-between gap-3">
+                <span className="flex flex-col gap-0.5">
+                  <span className="text-sm font-medium">{t("cameraOrientationRotate180Label")}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {t("cameraOrientationRotate180Desc")}
+                  </span>
+                </span>
+                <Switch
+                  checked={rotate180}
+                  onCheckedChange={(checked) => {
+                    setRotate180(checked);
+                    setInvertPtz(checked);
+                  }}
+                />
+              </label>
+
+              <label className="flex items-start justify-between gap-3 border-t pt-2.5">
+                <span className="flex flex-col gap-0.5">
+                  <span className="text-sm font-medium">{t("cameraOrientationInvertPtzLabel")}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {t("cameraOrientationInvertPtzDesc")}
+                  </span>
+                </span>
+                <Switch checked={invertPtz} onCheckedChange={setInvertPtz} />
+              </label>
+            </div>
           </DialogPanel>
           <DialogFooter>
             <DialogClose render={<Button disabled={saving} variant="ghost" />}>
@@ -281,6 +326,7 @@ interface SystemSettingsDialogProps {
   settings: DashboardSettings;
   logs: RelayEventLog[];
   capabilities?: RuntimeCapabilities;
+  ffmpegInstall?: FfmpegInstallState;
   updateState?: AppUpdateState;
   accessRequired?: boolean;
   onOpenChange: (open: boolean) => void;
@@ -290,6 +336,7 @@ interface SystemSettingsDialogProps {
   onDeleteStore: (store: Store) => Promise<void>;
   onEditCamera: (cam: CameraMeta) => void;
   onRefreshCameras: () => Promise<void>;
+  onInstallFfmpeg?: () => Promise<void>;
   onCheckUpdates?: () => Promise<void>;
   onApplyUpdate?: () => Promise<void>;
   onLock?: () => Promise<void>;
@@ -306,6 +353,7 @@ export function SystemSettingsDialog({
   settings,
   logs,
   capabilities,
+  ffmpegInstall,
   updateState,
   accessRequired = false,
   onOpenChange,
@@ -315,6 +363,7 @@ export function SystemSettingsDialog({
   onDeleteStore,
   onEditCamera,
   onRefreshCameras,
+  onInstallFfmpeg,
   onCheckUpdates,
   onApplyUpdate,
   onLock,
@@ -375,6 +424,9 @@ export function SystemSettingsDialog({
 
   const insecureContext = typeof window !== "undefined" && !window.isSecureContext;
   const ffmpegMissing = capabilities ? !capabilities.ffmpegAvailable : false;
+  const activeFfmpegState = ffmpegInstall ?? capabilities?.ffmpegInstall;
+  const ffmpegBusy =
+    activeFfmpegState?.phase === "downloading" || activeFfmpegState?.phase === "verifying";
 
   const settingsDirty =
     draft.gridFps !== settings.gridFps ||
@@ -458,7 +510,34 @@ export function SystemSettingsDialog({
                         {t("ffmpegMissingBadge")}
                       </Badge>
                     </AlertTitle>
-                    <AlertDescription>{t("ffmpegMissingDesc")}</AlertDescription>
+                    <AlertDescription className="flex flex-col gap-2">
+                      <span>{t("ffmpegMissingDesc")}</span>
+                      {activeFfmpegState?.phase === "error" && activeFfmpegState.error && (
+                        <span className="text-xs text-destructive-foreground">
+                          {activeFfmpegState.error}
+                        </span>
+                      )}
+                      {activeFfmpegState?.supported === false ? (
+                        <span className="text-xs text-muted-foreground">
+                          {t("ffmpegInstallUnsupported")}
+                        </span>
+                      ) : (
+                        onInstallFfmpeg && (
+                          <div className="flex items-center gap-2 pt-0.5">
+                            <Button
+                              disabled={ffmpegBusy}
+                              loading={ffmpegBusy}
+                              onClick={() => void onInstallFfmpeg()}
+                              size="sm"
+                              variant="default"
+                            >
+                              <DownloadIcon aria-hidden="true" />
+                              <span>{ffmpegInstallButtonLabel(activeFfmpegState, t)}</span>
+                            </Button>
+                          </div>
+                        )
+                      )}
+                    </AlertDescription>
                   </Alert>
                 )}
 
@@ -886,7 +965,7 @@ export function SystemSettingsDialog({
                           <span className="text-muted-foreground text-xs">
                             {t("updateCurrentVersion", {
                               version:
-                                updateState?.currentVersion ?? capabilities?.appVersion ?? "0.1.0",
+                                updateState?.currentVersion ?? capabilities?.appVersion ?? "0.2.0",
                             })}
                           </span>
                         </div>

@@ -33,7 +33,7 @@ const staticDir = resolveExistingPath(
 
 const ffmpegName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
 const bundledFfmpegPath = join(PATHS.RESOURCES_FOLDER, "app", "bin", ffmpegName);
-const ffmpegPath = existsSync(bundledFfmpegPath) ? bundledFfmpegPath : "ffmpeg";
+const ffmpegPath = existsSync(bundledFfmpegPath) ? bundledFfmpegPath : undefined;
 
 const runtimeConfig = resolveRuntimeServerConfig();
 const desktopUpdater = createDesktopUpdaterBridge();

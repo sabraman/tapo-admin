@@ -1,5 +1,6 @@
 import type {
   CameraMeta,
+  CameraOrientation,
   CameraTelemetry,
   NetworkKind,
   ResolvedLanguage,
@@ -26,6 +27,7 @@ export interface EmulatedCamera {
   storeId: string | null;
   status: SimulatedCameraStatus;
   scene: SimulatedSceneKind;
+  orientation?: CameraOrientation;
   createdAt: number;
 }
 
@@ -37,16 +39,20 @@ export interface EmulatedStore {
   createdAt: number;
 }
 
+export type EmulatedVideoSource = "auto" | "synthetic" | string;
+
 export interface EmulatedState {
   stores: EmulatedStore[];
   cameras: EmulatedCamera[];
   seq: number;
+  videoSource?: EmulatedVideoSource;
 }
 
 export const EMPTY_EMULATED_STATE: EmulatedState = {
   stores: [],
   cameras: [],
   seq: 1,
+  videoSource: "auto",
 };
 
 type StoreTemplate = { name: string; address: string; networkKind: NetworkKind };
@@ -126,6 +132,10 @@ export function loadEmulatedState(): EmulatedState {
       stores: Array.isArray(parsed.stores) ? parsed.stores : [],
       cameras: Array.isArray(parsed.cameras) ? parsed.cameras : [],
       seq: typeof parsed.seq === "number" && parsed.seq > 0 ? parsed.seq : 1,
+      videoSource:
+        typeof parsed.videoSource === "string" && parsed.videoSource.length > 0
+          ? parsed.videoSource
+          : "auto",
     };
   } catch {
     return EMPTY_EMULATED_STATE;
@@ -175,6 +185,7 @@ export function addEmulatedStore(
   };
 
   let next: EmulatedState = {
+    ...state,
     stores: [...state.stores, createdStore],
     cameras: [...state.cameras],
     seq,
@@ -225,7 +236,7 @@ export function addEmulatedCamera(
 export function updateEmulatedCamera(
   state: EmulatedState,
   deviceId: string,
-  patch: Partial<Pick<EmulatedCamera, "name" | "storeId" | "status" | "model" | "scene">>,
+  patch: Partial<Pick<EmulatedCamera, "name" | "storeId" | "status" | "model" | "scene" | "orientation">>,
 ): EmulatedState {
   return {
     ...state,
@@ -311,10 +322,44 @@ export function applyEmulatedPreset(
   }
 
   return {
+    ...state,
     stores: newStores,
     cameras: newCameras,
     seq,
   };
+}
+
+export function setEmulatedVideoSource(
+  state: EmulatedState,
+  videoSource: EmulatedVideoSource,
+): EmulatedState {
+  return {
+    ...state,
+    videoSource,
+  };
+}
+
+export function resolveMirrorSourceCamera(
+  emulated: EmulatedState,
+  realCameras: CameraMeta[],
+  realTelemetry: Record<string, CameraTelemetry>,
+  index = 0,
+): CameraMeta | null {
+  const mode = emulated.videoSource ?? "auto";
+  if (mode === "synthetic" || realCameras.length === 0) return null;
+
+  if (mode !== "auto") {
+    const exact = realCameras.find((c) => c.deviceId === mode);
+    if (exact) return exact;
+  }
+
+  const onlineReal = realCameras.filter((c) => {
+    const t = realTelemetry[c.deviceId];
+    if (t?.status === "offline") return false;
+    return t?.status === "streaming" || c.rawStatus === 1 || c.accessPlatform === "IOT";
+  });
+  const pool = onlineReal.length > 0 ? onlineReal : realCameras;
+  return pool[index % pool.length] ?? null;
 }
 
 export function setEmulatedCamerasMode(
@@ -377,22 +422,27 @@ export function mergeDashboardWithEmulator(
     })),
   ];
 
-  const emulatedMetas: CameraMeta[] = emulated.cameras.map((cam, idx) => ({
-    deviceId: cam.deviceId,
-    alias: cam.name,
-    customName: cam.name,
-    cloudNickname: cam.name,
-    deviceModel: cam.model,
-    deviceName: `${cam.model} (Sim)`,
-    deviceHwVer: "5.0",
-    fwVer: "1.5.7-sim",
-    deviceRegion: "eu-west-1",
-    mac: `DE:B0:60:${String((idx + 10) % 99).padStart(2, "0")}:${String((idx * 7 + 11) % 99).padStart(2, "0")}:01`,
-    accessPlatform: "SIMULATED",
-    appServerUrl: "local://emulator",
-    deviceType: "SMART.IPCAMERA",
-    rawStatus: cam.status === "online" ? 1 : 0,
-  }));
+  const emulatedMetas: CameraMeta[] = emulated.cameras.map((cam, idx) => {
+    const mirrorSource = resolveMirrorSourceCamera(emulated, realCameras, realTelemetry, idx);
+    return {
+      deviceId: cam.deviceId,
+      alias: cam.name,
+      customName: cam.name,
+      cloudNickname: cam.name,
+      orientation: cam.orientation ?? mirrorSource?.orientation,
+      ...(mirrorSource ? { mirrorSourceDeviceId: mirrorSource.deviceId } : {}),
+      deviceModel: cam.model,
+      deviceName: `${cam.model} (Sim)`,
+      deviceHwVer: "5.0",
+      fwVer: "1.5.7-sim",
+      deviceRegion: "eu-west-1",
+      mac: `DE:B0:60:${String((idx + 10) % 99).padStart(2, "0")}:${String((idx * 7 + 11) % 99).padStart(2, "0")}:01`,
+      accessPlatform: "SIMULATED",
+      appServerUrl: "local://emulator",
+      deviceType: "SMART.IPCAMERA",
+      rawStatus: cam.status === "online" ? 1 : 0,
+    };
+  });
 
   const telemetry: Record<string, CameraTelemetry> = { ...realTelemetry };
   const now = Date.now();

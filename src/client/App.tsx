@@ -1,6 +1,8 @@
 import {
+  AlertTriangleIcon,
   CheckIcon,
   ChevronDownIcon,
+  DownloadIcon,
   ImagesIcon,
   LayoutGridIcon,
   PlusIcon,
@@ -56,15 +58,17 @@ import {
   updateEmulatedStore,
   type EmulatedState,
 } from "@/lib/debug-emulator";
-import { useI18n } from "@/lib/i18n";
+import { ffmpegInstallButtonLabel, useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import type {
   AppUpdateState,
   AuthState,
   CameraMeta,
+  CameraOrientation,
   CameraTelemetry,
   DashboardBootstrap,
   DashboardSettings,
+  FfmpegInstallState,
   MediaItem,
   NetworkKind,
   RelayEventLog,
@@ -92,11 +96,11 @@ const DEFAULT_CAPABILITIES: RuntimeCapabilities = {
   ffmpegAvailable: true,
   debugEmulatorEnabled: false,
   desktopApp: false,
-  appVersion: "0.1.0",
+  appVersion: "0.2.0",
 };
 
 const DEFAULT_UPDATE_STATE: AppUpdateState = {
-  currentVersion: "0.1.0",
+  currentVersion: "0.2.0",
   phase: "idle",
   canAutoUpdate: false,
   releaseUrl: "https://github.com/sabraman/tapo-admin/releases/latest",
@@ -108,6 +112,7 @@ export function App(): React.ReactElement {
   const [accessRequired, setAccessRequired] = useState(false);
   const [accessUnlocked, setAccessUnlocked] = useState(true);
   const [capabilities, setCapabilities] = useState<RuntimeCapabilities>(DEFAULT_CAPABILITIES);
+  const [ffmpegInstall, setFfmpegInstall] = useState<FfmpegInstallState | undefined>(undefined);
   const [updateState, setUpdateState] = useState<AppUpdateState>(DEFAULT_UPDATE_STATE);
   const [initialUpdateCheckDone, setInitialUpdateCheckDone] = useState(false);
   const [updateToastVersion, setUpdateToastVersion] = useState<string | null>(null);
@@ -145,6 +150,7 @@ export function App(): React.ReactElement {
       setAccessUnlocked(Boolean(data.accessUnlocked));
       const caps = data.capabilities ?? DEFAULT_CAPABILITIES;
       setCapabilities(caps);
+      setFfmpegInstall(caps.ffmpegInstall);
       setUpdateState(
         data.updateState ?? {
           ...DEFAULT_UPDATE_STATE,
@@ -229,11 +235,54 @@ export function App(): React.ReactElement {
     }
   }
 
+  async function installFfmpeg() {
+    try {
+      const next = await api<FfmpegInstallState>("/api/system/ffmpeg/install", { method: "POST" });
+      setFfmpegInstall(next);
+      if (next.available) {
+        setCapabilities((prev) => ({ ...prev, ffmpegAvailable: true, ffmpegInstall: next }));
+        toastManager.add({ title: t("toastFfmpegInstalled"), type: "success" });
+      }
+    } catch (err) {
+      toastManager.add({
+        title: t("toastFfmpegInstallFailed"),
+        description: err instanceof Error ? err.message : undefined,
+        type: "error",
+      });
+    }
+  }
+
   useEffect(() => {
     if (!accessUnlocked || auth.status !== "authenticated" || initialUpdateCheckDone) return;
     setInitialUpdateCheckDone(true);
     void checkUpdates(true);
   }, [accessUnlocked, auth.status, initialUpdateCheckDone]);
+
+  useEffect(() => {
+    if (!accessUnlocked) return;
+    const phase = ffmpegInstall?.phase;
+    if (phase !== "downloading" && phase !== "verifying") return;
+    const timer = setInterval(() => {
+      void api<FfmpegInstallState>("/api/system/ffmpeg")
+        .then((next) => {
+          setFfmpegInstall(next);
+          if (next.available && next.phase === "ready") {
+            setCapabilities((prev) => ({ ...prev, ffmpegAvailable: true, ffmpegInstall: next }));
+            toastManager.add({ title: t("toastFfmpegInstalled"), type: "success" });
+          } else if (next.phase === "error") {
+            toastManager.add({
+              title: t("toastFfmpegInstallFailed"),
+              description: next.error,
+              type: "error",
+            });
+          }
+        })
+        .catch(() => {
+          // ignore transient errors while polling
+        });
+    }, 450);
+    return () => clearInterval(timer);
+  }, [accessUnlocked, ffmpegInstall?.phase]);
 
   useEffect(() => {
     if (!accessUnlocked) return;
@@ -482,28 +531,63 @@ export function App(): React.ReactElement {
 
   async function saveCameraMeta(
     deviceId: string,
-    payload: { customName: string; storeId: string | null },
+    payload: { customName?: string; storeId?: string | null; orientation?: CameraOrientation },
   ) {
     if (isSimulatedCamera(deviceId)) {
       setEmulated((prev) =>
         updateEmulatedCamera(prev, deviceId, {
-          ...(payload.customName.trim() ? { name: payload.customName.trim() } : {}),
-          storeId: payload.storeId,
+          ...(payload.customName?.trim() ? { name: payload.customName.trim() } : {}),
+          ...(payload.storeId !== undefined ? { storeId: payload.storeId } : {}),
+          ...(payload.orientation !== undefined ? { orientation: payload.orientation } : {}),
         }),
       );
       toastManager.add({ title: t("toastSimCameraUpdated"), type: "success" });
       return;
     }
-    const res = await api<{ cameras: CameraMeta[]; stores: Store[] }>(
-      `/api/cameras/${encodeURIComponent(deviceId)}`,
-      {
-        method: "PATCH",
-        body: JSON.stringify(payload),
-      },
-    );
-    setCameras(res.cameras);
-    setStores(res.stores);
-    toastManager.add({ title: t("toastCameraSaved"), type: "success" });
+
+    const prevCameras = cameras;
+    if (payload.orientation !== undefined) {
+      const normalized =
+        payload.orientation.rotate180 || payload.orientation.invertPtz
+          ? payload.orientation
+          : undefined;
+      setCameras((prev) =>
+        prev.map((cam) => {
+          if (cam.deviceId !== deviceId) return cam;
+          if (!normalized) {
+            const { orientation: _removed, ...rest } = cam;
+            return rest;
+          }
+          return { ...cam, orientation: normalized };
+        }),
+      );
+    }
+
+    try {
+      const res = await api<{ cameras: CameraMeta[]; stores: Store[] }>(
+        `/api/cameras/${encodeURIComponent(deviceId)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify(payload),
+        },
+      );
+      setCameras(res.cameras);
+      setStores(res.stores);
+      toastManager.add({ title: t("toastCameraSaved"), type: "success" });
+    } catch (err) {
+      if (payload.orientation !== undefined) {
+        setCameras(prevCameras);
+      }
+      toastManager.add({
+        title: t("settingsSaveError"),
+        description: err instanceof Error ? err.message : undefined,
+        type: "error",
+      });
+    }
+  }
+
+  async function updateCameraOrientation(deviceId: string, orientation: CameraOrientation) {
+    await saveCameraMeta(deviceId, { orientation });
   }
 
   async function saveStore(data: { id?: string; name: string }) {
@@ -1013,6 +1097,36 @@ export function App(): React.ReactElement {
         </div>
       </header>
 
+      {!capabilities.ffmpegAvailable && (
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-warning/10 px-3 py-2 text-xs sm:px-4">
+          <div className="flex min-w-0 items-center gap-2">
+            <AlertTriangleIcon aria-hidden="true" className="size-4 shrink-0 text-warning-foreground" />
+            <div className="flex min-w-0 flex-col">
+              <span className="font-medium text-foreground">{t("ffmpegMissingTitle")}</span>
+              <span className="text-[11px] text-muted-foreground">
+                {ffmpegInstall?.phase === "error" && ffmpegInstall.error
+                  ? ffmpegInstall.error
+                  : ffmpegInstall?.supported === false
+                    ? t("ffmpegInstallUnsupported")
+                    : t("ffmpegMissingDesc")}
+              </span>
+            </div>
+          </div>
+          {ffmpegInstall?.supported !== false && (
+            <Button
+              disabled={ffmpegInstall?.phase === "downloading" || ffmpegInstall?.phase === "verifying"}
+              loading={ffmpegInstall?.phase === "downloading" || ffmpegInstall?.phase === "verifying"}
+              onClick={() => void installFfmpeg()}
+              size="xs"
+              variant="default"
+            >
+              <DownloadIcon aria-hidden="true" />
+              <span>{ffmpegInstallButtonLabel(ffmpegInstall, t)}</span>
+            </Button>
+          )}
+        </div>
+      )}
+
       {/* Main Video Wall / Focus View filling all available space */}
       <main className="min-h-0 flex-1 overflow-y-auto p-2.5 sm:p-3">
         {visibleCameras.length === 0 ? (
@@ -1069,13 +1183,26 @@ export function App(): React.ReactElement {
             autoCyclePaused={autoCyclePaused}
             camera={focusedCamera}
             cameras={visibleCameras}
+            media={media}
+            mediaDir={mediaDir}
             onClipSave={captureClipToGallery}
+            onDeleteMedia={deleteMedia}
             onEditCamera={(cam) => setEditingCamera(cam)}
             onExitFocus={() => setViewMode("grid")}
+            onMediaSaved={(res) => {
+              setMedia(res.media);
+              setMediaDir(res.mediaDir);
+              notifySavedMedia(t("toastSdClipSaved"), res.item);
+            }}
+            onOpenGallery={(itemId) => {
+              setGalleryInitialId(itemId ?? null);
+              setGalleryOpen(true);
+            }}
             onSelectCamera={(id) => openFocus(id)}
             onSnapshot={captureSnapshotToGallery}
             onStepCamera={stepFocus}
             onToggleAutoCyclePause={() => setAutoCyclePaused((p) => !p)}
+            onUpdateOrientation={updateCameraOrientation}
             settings={settings}
             storeName={findCameraStore(effectiveStores, focusedCamera.deviceId)?.name}
             telemetryMap={effectiveTelemetry}
@@ -1122,8 +1249,10 @@ export function App(): React.ReactElement {
         auth={auth}
         cameras={effectiveCameras}
         capabilities={capabilities}
+        ffmpegInstall={ffmpegInstall}
         initialTab={systemTab}
         logs={logs}
+        onInstallFfmpeg={installFfmpeg}
         onCreateStore={() => {
           setEditingStore(null);
           setStoreDialogOpen(true);
@@ -1176,6 +1305,7 @@ export function App(): React.ReactElement {
             onChange={setEmulated}
             onFocusCamera={(id) => openFocus(id)}
             onSelectStoreFilter={selectStoreFilter}
+            realCameras={cameras}
             realStores={stores}
             storeOnlineCounts={storeOnlineCounts}
           />

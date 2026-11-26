@@ -54,7 +54,10 @@ function parseBoolEnv(value: string | undefined): boolean | undefined {
  * Resolves the ffmpeg binary across explicit configuration, bundled desktop/app locations,
  * system PATH, and common macOS/Linux install prefixes.
  */
-export function findFfmpegBinary(preferredPath?: string): string | null {
+export function findFfmpegBinary(
+  preferredPath?: string,
+  extraDirs: string[] = [],
+): string | null {
   const exeName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
 
   const tryExplicit = (candidate: string | undefined): string | null => {
@@ -74,6 +77,7 @@ export function findFfmpegBinary(preferredPath?: string): string | null {
 
   const execDir = dirname(process.execPath);
   const bundledCandidates = [
+    ...extraDirs.map((dir) => join(dir, exeName)),
     join(execDir, exeName),
     join(execDir, "bin", exeName),
     join(execDir, "..", "Resources", exeName),

@@ -9,7 +9,13 @@ import {
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { normalizeLanguagePreference } from "../shared/i18n";
-import type { DashboardSettings, MediaItem, NetworkKind, Store } from "../shared/types";
+import type {
+  CameraOrientation,
+  DashboardSettings,
+  MediaItem,
+  NetworkKind,
+  Store,
+} from "../shared/types";
 
 export interface StoredSession {
   email: string;
@@ -27,6 +33,7 @@ export interface WorkspaceConfig {
   storeMeta: Record<string, { address?: string; networkKind?: NetworkKind }>;
   roomOverrides: Record<string, string>;
   customNames: Record<string, string>;
+  cameraOrientations: Record<string, CameraOrientation>;
   settings: DashboardSettings;
 }
 
@@ -110,6 +117,7 @@ export class AppStorage {
       storeMeta: {},
       roomOverrides: {},
       customNames: {},
+      cameraOrientations: {},
       settings: { ...DEFAULT_SETTINGS },
     });
     if (!existsSync(this.workspacePath)) {
@@ -126,6 +134,7 @@ export class AppStorage {
         storeMeta: parsed.storeMeta ?? {},
         roomOverrides: parsed.roomOverrides ?? {},
         customNames: parsed.customNames ?? {},
+        cameraOrientations: parsed.cameraOrientations ?? {},
         settings: {
           ...DEFAULT_SETTINGS,
           ...(parsed.settings ?? {}),

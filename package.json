@@ -1,6 +1,6 @@
 {
   "name": "tapo-admin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Multi-camera live view, PTZ, two-way audio, and SD archive viewer for TP-Link Tapo cameras via Electrobun desktop or Docker.",
   "license": "MIT",
   "type": "module",

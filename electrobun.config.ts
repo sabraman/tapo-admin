@@ -21,6 +21,7 @@ export default {
     },
     copy: {
       "dist/client": "views/client",
+      "dist/bin": "bin",
       "certs/tapo-cloud-roots.pem": "certs/tapo-cloud-roots.pem",
       "assets/tray-Template.png": "assets/tray-Template.png",
       "assets/tray.ico": "assets/tray.ico",

@@ -54,6 +54,7 @@ class CameraWorker {
   private audioProc: Bun.Subprocess<"pipe", "pipe", "ignore"> | null = null;
 
   private running = false;
+  private playbackHolds = 0;
   private loopPromise: Promise<void> | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private abortCurrentRelay: (() => void) | null = null;
@@ -275,6 +276,7 @@ class CameraWorker {
   }
 
   private ensureRunning(): void {
+    if (this.playbackHolds > 0) return;
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
       this.idleTimer = null;
@@ -289,14 +291,40 @@ class CameraWorker {
         this.kbps = 0;
         this.onUpdate();
         // If a listener arrived while the previous loop was tearing down, start cleanly.
-        if (this.hasAnyListeners()) {
+        if (this.playbackHolds === 0 && this.hasAnyListeners()) {
           queueMicrotask(() => {
-            if (this.hasAnyListeners()) this.ensureRunning();
+            if (this.playbackHolds === 0 && this.hasAnyListeners()) this.ensureRunning();
           });
         }
       });
     }
     this.onUpdate();
+  }
+
+  async acquirePlaybackHold(): Promise<() => void> {
+    this.playbackHolds += 1;
+    const hadActiveRelay = Boolean(this.activeSocket || this.loopPromise || this.running);
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+    this.running = false;
+    this.interruptRelay();
+    if (this.loopPromise) {
+      await Promise.race([this.loopPromise.catch(() => {}), Bun.sleep(2000)]);
+    }
+    if (hadActiveRelay) {
+      await Bun.sleep(400);
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.playbackHolds = Math.max(0, this.playbackHolds - 1);
+      if (this.playbackHolds === 0 && this.hasAnyListeners()) {
+        this.ensureRunning();
+      }
+    };
   }
 
   private scheduleIdleStop(): void {
@@ -328,7 +356,7 @@ class CameraWorker {
 
   private async runLoop(): Promise<void> {
     let firstAttempt = true;
-    while (this.running && this.hasAnyListeners()) {
+    while (this.running && this.playbackHolds === 0 && this.hasAnyListeners()) {
       const creds = this.getCreds();
       if (!creds) {
         this.status = "error";
@@ -351,6 +379,7 @@ class CameraWorker {
         await this.runSingleRelay(creds.baseUrl, creds.token);
         this.lastError = null;
       } catch (err) {
+        if (this.playbackHolds > 0 || !this.running) break;
         const msg = err instanceof Error ? err.message : String(err);
         this.lastError = msg;
         if (err instanceof TapoCloudError && err.isAuthError) {
@@ -388,7 +417,14 @@ class CameraWorker {
       streamType: 0,
     });
 
-    if (!this.running || !this.hasAnyListeners() || this.desiredResolution() !== resolution) return;
+    if (
+      this.playbackHolds > 0 ||
+      !this.running ||
+      !this.hasAnyListeners() ||
+      this.desiredResolution() !== resolution
+    ) {
+      return;
+    }
 
     this.tsGop.reset();
     const extractor = new MulawTsExtractor();
@@ -779,7 +815,8 @@ export class StreamManager {
   private eventListeners = new Set<(ev: { type: "telemetry" | "log"; data: unknown }) => void>();
   private logs: RelayEventLog[] = [];
   private activeCleanups = new Set<() => void>();
-  private readonly ffmpegPath: string | null;
+  private activePlaybacks = new Map<string, () => void>();
+  private readonly getFfmpegPath: () => string | null;
   private readonly getLang: () => ResolvedLanguage;
 
   constructor(
@@ -788,12 +825,19 @@ export class StreamManager {
     private getSettings: () => DashboardSettings,
     private onAuthExpired: () => Promise<boolean>,
     options?: {
-      ffmpegPath?: string | null;
+      ffmpegPath?: string | null | (() => string | null);
       getLang?: () => ResolvedLanguage;
     },
   ) {
-    this.ffmpegPath =
-      options?.ffmpegPath !== undefined ? options.ffmpegPath : findFfmpegBinary();
+    if (typeof options?.ffmpegPath === "function") {
+      this.getFfmpegPath = options.ffmpegPath;
+    } else if (options?.ffmpegPath !== undefined) {
+      const fixed = options.ffmpegPath;
+      this.getFfmpegPath = () => fixed;
+    } else {
+      const detected = findFfmpegBinary();
+      this.getFfmpegPath = () => detected;
+    }
     this.getLang = options?.getLang ?? (() => "en");
   }
 
@@ -823,7 +867,7 @@ export class StreamManager {
             cam,
             this.getCreds,
             this.getSettings,
-            () => this.ffmpegPath,
+            this.getFfmpegPath,
             this.getLang,
             this.client,
             () => this.emitTelemetry(),
@@ -894,6 +938,14 @@ export class StreamManager {
   }
 
   stopAll(): void {
+    for (const abortPb of Array.from(this.activePlaybacks.values())) {
+      try {
+        abortPb();
+      } catch {
+        // ignore
+      }
+    }
+    this.activePlaybacks.clear();
     for (const cleanup of Array.from(this.activeCleanups)) {
       try {
         cleanup();
@@ -903,6 +955,52 @@ export class StreamManager {
     }
     this.activeCleanups.clear();
     for (const w of this.workers.values()) w.stopImmediate();
+  }
+
+  async acquirePlaybackSlot(
+    deviceId: string,
+    abortCurrent: () => void,
+  ): Promise<() => void> {
+    const prevAbort = this.activePlaybacks.get(deviceId);
+    if (prevAbort) {
+      this.activePlaybacks.delete(deviceId);
+      try {
+        prevAbort();
+      } catch {
+        // ignore
+      }
+      await Bun.sleep(250);
+    }
+    this.activePlaybacks.set(deviceId, abortCurrent);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (this.activePlaybacks.get(deviceId) === abortCurrent) {
+        this.activePlaybacks.delete(deviceId);
+      }
+    };
+  }
+
+  async suspendLiveWorker(deviceId: string): Promise<() => void> {
+    const worker = this.workers.get(deviceId);
+    if (!worker) return () => {};
+    return await worker.acquirePlaybackHold();
+  }
+
+  async acquirePlaybackSession(
+    deviceId: string,
+    abortCurrent: () => void,
+  ): Promise<() => void> {
+    const releaseSlot = await this.acquirePlaybackSlot(deviceId, abortCurrent);
+    const releaseWorker = await this.suspendLiveWorker(deviceId);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      releaseWorker();
+      releaseSlot();
+    };
   }
 
   subscribeMjpeg(deviceId: string, fn: MjpegListener): () => void {
@@ -1076,31 +1174,72 @@ export class StreamManager {
     return { sendAlaw, close };
   }
 
-  async captureSnapshot(deviceId: string): Promise<Buffer> {
+  async captureSnapshot(deviceId: string, opts?: { rotate180?: boolean }): Promise<Buffer> {
     const w = this.workers.get(deviceId);
     if (!w) throw new Error(tServer(this.getLang(), "camera_not_found"));
     const cached = w.getLatestJpeg();
-    if (cached && Date.now() - cached.ts < 5000) return cached.jpeg;
-
-    return await new Promise<Buffer>((resolve, reject) => {
-      let unsub: (() => void) | null = null;
-      const timer = setTimeout(() => {
-        unsub?.();
-        reject(new Error(tServer(this.getLang(), "snapshot_timeout")));
-      }, 16_000);
-      unsub = w.addMjpegListener((jpeg) => {
-        clearTimeout(timer);
-        unsub?.();
-        resolve(jpeg);
+    let jpeg: Buffer;
+    if (cached && Date.now() - cached.ts < 5000) {
+      jpeg = cached.jpeg;
+    } else {
+      jpeg = await new Promise<Buffer>((resolve, reject) => {
+        let unsub: (() => void) | null = null;
+        const timer = setTimeout(() => {
+          unsub?.();
+          reject(new Error(tServer(this.getLang(), "snapshot_timeout")));
+        }, 16_000);
+        unsub = w.addMjpegListener((frame) => {
+          clearTimeout(timer);
+          unsub?.();
+          resolve(frame);
+        });
       });
-    });
+    }
+
+    if (opts?.rotate180) {
+      const bin = this.getFfmpegPath();
+      if (bin) {
+        const rotProc = Bun.spawnSync(
+          [
+            bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-i",
+            "pipe:0",
+            "-vf",
+            "hflip,vflip",
+            "-vcodec",
+            "mjpeg",
+            "-q:v",
+            "3",
+            "-f",
+            "image2",
+            "pipe:1",
+          ],
+          { stdin: jpeg },
+        );
+        if (rotProc.exitCode === 0 && rotProc.stdout.byteLength > 0) {
+          return Buffer.from(rotProc.stdout);
+        }
+      }
+    }
+    return jpeg;
   }
 
-  async captureMp4Clip(deviceId: string, durationSec = 4): Promise<Buffer> {
+  async captureMp4Clip(
+    deviceId: string,
+    durationSec = 4,
+    opts?: { rotate180?: boolean },
+  ): Promise<Buffer> {
     const w = this.workers.get(deviceId);
     if (!w) throw new Error(tServer(this.getLang(), "camera_not_found"));
 
-    const bin = this.ffmpegPath;
+    const bin = this.getFfmpegPath();
     if (!bin) {
       throw new Error(tServer(this.getLang(), "ffmpeg_missing"));
     }
@@ -1151,6 +1290,7 @@ export class StreamManager {
           "-hide_banner",
           "-loglevel",
           "error",
+          ...(opts?.rotate180 ? ["-display_rotation", "180"] : []),
           "-f",
           "mpegts",
           "-i",
